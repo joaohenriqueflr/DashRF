@@ -5,7 +5,19 @@ import sqlite3
 from datetime import date, datetime
 from pathlib import Path
 
-from dash import Input, Output, State, callback, ctx, dcc, html, register_page, no_update
+from dash import (
+    ClientsideFunction,
+    Input,
+    Output,
+    State,
+    callback,
+    clientside_callback,
+    ctx,
+    dcc,
+    html,
+    register_page,
+    no_update,
+)
 from dash.exceptions import PreventUpdate
 import dash_ag_grid as dag
 import dash_bootstrap_components as dbc
@@ -15,28 +27,98 @@ register_page(__name__, path="/rfq", name="UGM Request for Quote")
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATABASE_PATH = BASE_DIR / "data" / "fixed_income.db"
-RFQ_MATURITY_TABLE = "RFQ_FIXED_INCOME_MATURITY"
 
-def load_sovereign_maturity_options(bond_name):
-    if not bond_name:
+
+def _sovereign_security_type(security_name):
+    if not security_name:
+        return ""
+    return str(security_name).strip().split(" ", 1)[0]
+
+
+def _sovereign_maturity_label(security_name):
+    if not security_name:
+        return ""
+    parts = str(security_name).strip().split(" ", 1)
+    return parts[1] if len(parts) > 1 else parts[0]
+
+
+def load_sovereign_bond_options():
+    if not DATABASE_PATH.exists():
         return []
+    security_type_expr = "substr(NM_SECURITY, 1, instr(NM_SECURITY || ' ', ' ') - 1)"
     try:
         with sqlite3.connect(DATABASE_PATH) as conn:
             rows = conn.execute(
                 f"""
-                SELECT DISTINCT DT_MATURITY
-                FROM {RFQ_MATURITY_TABLE}
-                WHERE NM_BOND_NAME = ?
-                ORDER BY DT_MATURITY
-                """,
-                (bond_name,),
+                SELECT DISTINCT NM_SECURITY
+                FROM FIXED_INCOME_SECURITY_CLASSIFICATION
+                WHERE NM_SECTOR = 'Sovereign'
+                  AND NM_SECURITY IS NOT NULL
+                  AND TRIM(NM_SECURITY) <> ''
+                ORDER BY
+                    CASE {security_type_expr}
+                        WHEN 'LFT' THEN 1
+                        WHEN 'NTN-B' THEN 2
+                        WHEN 'NTN-F' THEN 3
+                        WHEN 'LTN' THEN 4
+                        WHEN 'NTN-C' THEN 5
+                        ELSE 99
+                    END,
+                    {security_type_expr}
+                """
             ).fetchall()
-        return [{"label": row[0], "value": row[0]} for row in rows]
+        seen = set()
+        options = []
+        for (security_name,) in rows:
+            security_type = _sovereign_security_type(security_name)
+            if not security_type or security_type in seen:
+                continue
+            seen.add(security_type)
+            options.append({"value": security_type, "label": security_type})
+        return options
     except sqlite3.Error:
         return []
 
 
-DEFAULT_SOVEREIGN_MATURITY_OPTIONS = load_sovereign_maturity_options("LFT")
+def load_sovereign_maturity_options(bond_name):
+    if not bond_name:
+        return []
+    if not DATABASE_PATH.exists():
+        return []
+    try:
+        with sqlite3.connect(DATABASE_PATH) as conn:
+            rows = conn.execute(
+                """
+                SELECT NM_SECURITY, DT_MATURITY
+                FROM FIXED_INCOME_SECURITY_CLASSIFICATION
+                WHERE NM_SECTOR = 'Sovereign'
+                  AND NM_SECURITY IS NOT NULL
+                  AND TRIM(NM_SECURITY) <> ''
+                  AND DT_MATURITY IS NOT NULL
+                  AND TRIM(DT_MATURITY) <> ''
+                  AND substr(NM_SECURITY, 1, instr(NM_SECURITY || ' ', ' ') - 1) = ?
+                ORDER BY DT_MATURITY
+                """,
+                (bond_name,),
+            ).fetchall()
+        return [
+            {
+                "label": _sovereign_maturity_label(security_name),
+                "value": security_name,
+            }
+            for security_name, _maturity in rows
+        ]
+    except sqlite3.Error:
+        return []
+
+
+SOVEREIGN_BOND_OPTIONS = load_sovereign_bond_options()
+DEFAULT_SOVEREIGN_BOND = (
+    SOVEREIGN_BOND_OPTIONS[0]["value"] if SOVEREIGN_BOND_OPTIONS else "LFT"
+)
+DEFAULT_SOVEREIGN_MATURITY_OPTIONS = load_sovereign_maturity_options(
+    DEFAULT_SOVEREIGN_BOND
+)
 
 def _format_quantity(value):
     if value in (None, "", "--"):
@@ -183,7 +265,7 @@ def _build_rfq_text(row_data):
     if not row_data:
         return ""
     direction = str(row_data.get("direction") or "").lower()
-    side = "bid" if direction == "sell" else "ask"
+    side = "bid" if direction == "sell" else "offer"
     RFQ_text_parts = []
     if side:
         RFQ_text_parts.append(side)
@@ -192,7 +274,7 @@ def _build_rfq_text(row_data):
         RFQ_text_parts.append(str(security))
     if row_data.get("asset_class") == "Sovereign Bond":
         maturity = _format_maturity_label(row_data.get("maturity"))
-        if maturity:
+        if maturity and maturity not in str(security or ""):
             RFQ_text_parts.append(maturity)
     volume = _parse_number(row_data.get("volume_raw"))
     if volume and volume > 0:
@@ -379,11 +461,15 @@ def ensure_rfq_schema():
                     """
                 )
 
-            if "RFQ_FIXED_INCOME_MATURITY" in tables:
+            if "FIXED_INCOME_SECURITY_CLASSIFICATION" in tables:
                 conn.execute(
                     """
-                    CREATE INDEX IF NOT EXISTS idx_rfq_maturity_bond_maturity
-                    ON RFQ_FIXED_INCOME_MATURITY (NM_BOND_NAME, DT_MATURITY)
+                    CREATE INDEX IF NOT EXISTS idx_fix_class_sector_type_maturity
+                    ON FIXED_INCOME_SECURITY_CLASSIFICATION (
+                        NM_SECTOR,
+                        NM_INSTRUMENT_TYPE,
+                        DT_MATURITY
+                    )
                     """
                 )
 
@@ -480,6 +566,7 @@ def load_corporate_security_options():
                     sc.NM_INDEX
                 FROM FIXED_INCOME_SECURITY_CLASSIFICATION sc
                 WHERE sc.NM_SECURITY IS NOT NULL AND TRIM(sc.NM_SECURITY) <> ''
+                  AND COALESCE(sc.NM_SECTOR, '') <> 'Sovereign'
                 ORDER BY sc.NM_SECURITY
                 """
             ).fetchall()
@@ -692,7 +779,7 @@ layout = dbc.Container(
         ),
         dcc.Store(id="rfq-refresh", data=0),
         dcc.Clipboard(id="rfq-copy-clipboard", style={"display": "none"}),
-        dcc.Clipboard(id="rfq-grid-clipboard", style={"display": "none"}),
+        dcc.Store(id="rfq-grid-copy-result"),
         dcc.Store(id="rfq-copy-text", data=""),
         html.Div(
             className="rfq-hero",
@@ -871,25 +958,8 @@ layout = dbc.Container(
                                                         className="rfq-form-label",
                                                     ),
                                                     dmc.SegmentedControl(
-                                                        data=[
-                                                            {
-                                                                "value": "LFT",
-                                                                "label": "LFT",
-                                                            },
-                                                            {
-                                                                "value": "NTN-B",
-                                                                "label": "NTN-B",
-                                                            },
-                                                            {
-                                                                "value": "NTN-F",
-                                                                "label": "NTN-F",
-                                                            },
-                                                            {
-                                                                "value": "LTN",
-                                                                "label": "LTN",
-                                                            },
-                                                        ],
-                                                        value="LFT",
+                                                        data=SOVEREIGN_BOND_OPTIONS,
+                                                        value=DEFAULT_SOVEREIGN_BOND,
                                                         className="rfq-segment",
                                                         fullWidth=True,
                                                         id="rfq-bond-name-sovereign",
@@ -1273,206 +1343,232 @@ layout = dbc.Container(
                     className="rfq-form-header",
                     children=[
                         html.Div(
-                            "New Derivatives RFQ",
+                            [
+                                html.Span("Options RFQ", className="rfq-form-title"),
+                                html.Span("New Request", className="rfq-form-kicker"),
+                            ],
                             className="rfq-form-title",
                         ),
                     ],
                 ),
+                dcc.Input(
+                    id="rfq-quote-type-derivatives",
+                    value="Trade",
+                    type="hidden",
+                ),
+                dcc.Input(
+                    id="rfq-qty-derivatives",
+                    value="",
+                    type="hidden",
+                ),
                 html.Div(
-                    className="rfq-form-grid",
+                    className="rfq-derivatives-grid",
                     children=[
-                        html.Fieldset(
-                            className="rfq-fieldset",
+                        html.Div(
+                            className="rfq-form-field",
                             children=[
-                                html.Legend(
-                                    "Trade Type", className="rfq-fieldset-title"
-                                ),
                                 html.Div(
-                                    className="rfq-fieldset-body",
+                                    "Quote Requester *",
+                                    className="rfq-form-label",
+                                ),
+                                dcc.Dropdown(
+                                    className="rfq-input rfq-select",
+                                    options=load_requesters(),
+                                    value=None,
+                                    placeholder="Client / desk name",
+                                    clearable=False,
+                                    maxHeight=420,
+                                    id="rfq-requester-derivatives",
+                                ),
+                            ],
+                        ),
+                        html.Div(
+                            className="rfq-form-field",
+                            children=[
+                                html.Div(
+                                    "Underlying *",
+                                    className="rfq-form-label",
+                                ),
+                                dcc.Dropdown(
+                                    className="rfq-input rfq-select",
+                                    options=[
+                                        {"label": "DI1", "value": "DI1"},
+                                        {"label": "DOL", "value": "DOL"},
+                                        {"label": "IND", "value": "IND"},
+                                        {"label": "CDI", "value": "CDI"},
+                                    ],
+                                    value=None,
+                                    placeholder="Select ticker...",
+                                    clearable=False,
+                                    maxHeight=420,
+                                    id="rfq-bond-name-derivatives",
+                                ),
+                            ],
+                        ),
+                        html.Div(
+                            className="rfq-form-field",
+                            children=[
+                                html.Div("Maturity *", className="rfq-form-label"),
+                                html.Div(
+                                    className="rfq-maturity-control",
                                     children=[
-                                        html.Div(
-                                            className="rfq-form-field",
-                                            children=dmc.Stack(
-                                                [
-                                                    dmc.Text(
-                                                        "Direction",
-                                                        className="rfq-form-label",
-                                                    ),
-                                                    dmc.SegmentedControl(
-                                                        data=[
-                                                            {
-                                                                "value": "Buy",
-                                                                "label": "Buy",
-                                                            },
-                                                            {
-                                                                "value": "Sell",
-                                                                "label": "Sell",
-                                                            },
-                                                        ],
-                                                        value="Buy",
-                                                        className="rfq-segment",
-                                                        fullWidth=True,
-                                                        id="rfq-direction-derivatives",
-                                                    ),
-                                                ],
-                                                align="flex-start",
-                                                gap="xs",
-                                            ),
+                                        dcc.Input(
+                                            className="rfq-input",
+                                            placeholder="e.g. 3",
+                                            type="text",
+                                            id="rfq-maturity-derivatives",
                                         ),
-                                        html.Div(
-                                            className="rfq-form-field",
-                                            children=dmc.Stack(
-                                                [
-                                                    dmc.Text(
-                                                        "Quote Type",
-                                                        className="rfq-form-label",
-                                                    ),
-                                                    dmc.SegmentedControl(
-                                                        data=[
-                                                            {
-                                                                "value": "Trade",
-                                                                "label": "Trade",
-                                                            },
-                                                            {
-                                                                "value": "Mkt Color",
-                                                                "label": "Mkt Color",
-                                                            },
-                                                        ],
-                                                        value="Trade",
-                                                        className="rfq-segment",
-                                                        fullWidth=True,
-                                                        id="rfq-quote-type-derivatives",
-                                                    ),
-                                                ],
-                                                align="flex-start",
-                                                gap="xs",
-                                            ),
+                                        dcc.Dropdown(
+                                            className="rfq-input rfq-select rfq-maturity-unit",
+                                            options=[
+                                                {"label": "D", "value": "D"},
+                                                {"label": "M", "value": "M"},
+                                                {"label": "Y", "value": "Y"},
+                                            ],
+                                            value="M",
+                                            clearable=False,
+                                            searchable=False,
+                                            id="rfq-maturity-unit-derivatives",
                                         ),
                                     ],
                                 ),
                             ],
                         ),
-                        html.Fieldset(
-                            className="rfq-fieldset",
+                        html.Div(
+                            className="rfq-form-field",
                             children=[
-                                html.Legend(
-                                    "Traded Security",
-                                    className="rfq-fieldset-title",
+                                html.Div("Notional *", className="rfq-form-label"),
+                                dcc.Input(
+                                    className="rfq-input",
+                                    placeholder="e.g. 10,000,000",
+                                    type="text",
+                                    id="rfq-volume-derivatives",
+                                ),
+                            ],
+                        ),
+                        html.Div(
+                            className="rfq-form-field",
+                            children=[
+                                html.Div("Premium *", className="rfq-form-label"),
+                                dcc.Input(
+                                    className="rfq-input",
+                                    placeholder="e.g. 0.05",
+                                    type="number",
+                                    step="0.01",
+                                    id="rfq-limit-derivatives",
+                                ),
+                            ],
+                        ),
+                        html.Div(
+                            className="rfq-legs-header",
+                            children=[
+                                html.Div("Legs", className="rfq-fieldset-title"),
+                                html.Button(
+                                    "+ Add Leg",
+                                    className="rfq-link-btn",
+                                    type="button",
+                                ),
+                            ],
+                        ),
+                        html.Div(
+                            className="rfq-derivatives-leg",
+                            children=[
+                                html.Div(
+                                    className="rfq-form-field rfq-leg-side",
+                                    children=[
+                                        html.Div("Side", className="rfq-form-label"),
+                                        dmc.SegmentedControl(
+                                            data=[
+                                                {"value": "Buy", "label": "Buy"},
+                                                {"value": "Sell", "label": "Sell"},
+                                            ],
+                                            value="Buy",
+                                            className="rfq-segment",
+                                            fullWidth=True,
+                                            id="rfq-direction-derivatives",
+                                        ),
+                                    ],
                                 ),
                                 html.Div(
-                                    className="rfq-fieldset-body",
+                                    className="rfq-form-field rfq-leg-strategy",
                                     children=[
-                                        html.Div(
-                                            className="rfq-form-field",
-                                            children=dmc.Stack(
-                                                [
-                                                    dmc.Text(
-                                                        "Bond Name",
-                                                        className="rfq-form-label",
-                                                    ),
-                                                    dmc.SegmentedControl(
-                                                        data=[
-                                                            {
-                                                                "value": "LFT",
-                                                                "label": "LFT",
-                                                            },
-                                                            {
-                                                                "value": "NTN-B",
-                                                                "label": "NTN-B",
-                                                            },
-                                                            {
-                                                                "value": "NTN-F",
-                                                                "label": "NTN-F",
-                                                            },
-                                                            {
-                                                                "value": "LTN",
-                                                                "label": "LTN",
-                                                            },
-                                                        ],
-                                                        value="LFT",
-                                                        className="rfq-segment",
-                                                        fullWidth=True,
-                                                        id="rfq-bond-name-derivatives",
-                                                    ),
-                                                ],
-                                                align="flex-start",
-                                                gap="xs",
-                                            ),
+                                        html.Div("Strategy", className="rfq-form-label"),
+                                        dcc.Dropdown(
+                                            className="rfq-input rfq-select",
+                                            options=[
+                                                {"label": "Call", "value": "Call"},
+                                                {"label": "Put", "value": "Put"},
+                                                {"label": "Call Spread", "value": "Call Spread"},
+                                                {"label": "Put Spread", "value": "Put Spread"},
+                                            ],
+                                            value="Call",
+                                            clearable=False,
+                                            maxHeight=420,
+                                            id="rfq-strategy-derivatives",
+                                        ),
+                                    ],
+                                ),
+                                html.Div(
+                                    className="rfq-form-field rfq-leg-solve-field",
+                                    children=[
+                                        html.Div("Strike", className="rfq-form-label"),
+                                        dcc.Input(
+                                            className="rfq-input",
+                                            placeholder="Strike",
+                                            type="number",
+                                            id="rfq-strike-derivatives",
                                         ),
                                         html.Div(
-                                            className="rfq-form-field",
+                                            className="rfq-solve-option",
                                             children=[
-                                                html.Div(
-                                                    "Maturity Date",
-                                                    className="rfq-form-label",
-                                                ),
-                                                dcc.Dropdown(
-                                                    className="rfq-input rfq-select",
-                                                    options=[
-                                                        {
-                                                            "label": "2026-01-15",
-                                                            "value": "2026-01-15",
-                                                        },
-                                                        {
-                                                            "label": "2027-01-15",
-                                                            "value": "2027-01-15",
-                                                        },
-                                                        {
-                                                            "label": "2028-07-01",
-                                                            "value": "2028-07-01",
-                                                        },
-                                                    ],
-                                                    value=None,
-                                                    placeholder="Select maturity date",
-                                                    clearable=False,
-                                                    maxHeight=420,
-                                                    id="rfq-maturity-derivatives",
+                                                dcc.Checklist(
+                                                    options=[{"label": "Solve", "value": "solve"}],
+                                                    value=["solve"],
+                                                    id="rfq-strike-solve-derivatives",
                                                 ),
                                             ],
                                         ),
                                     ],
                                 ),
-                            ],
-                        ),
-                        html.Fieldset(
-                            className="rfq-fieldset",
-                            children=[
-                                html.Legend(
-                                    "Trade Definition",
-                                    className="rfq-fieldset-title",
-                                ),
                                 html.Div(
-                                    className="rfq-fieldset-body",
+                                    className="rfq-form-field rfq-leg-solve-field rfq-leg-barrier",
                                     children=[
+                                        html.Div("Barrier", className="rfq-form-label"),
+                                        dcc.Input(
+                                            className="rfq-input",
+                                            placeholder="Barrier",
+                                            type="number",
+                                            id="rfq-barrier-derivatives",
+                                        ),
                                         html.Div(
-                                            className="rfq-form-field",
+                                            className="rfq-solve-option",
                                             children=[
-                                                html.Div(
-                                                    "Quantity (optional)",
-                                                    className="rfq-form-label",
-                                                ),
-                                                dcc.Input(
-                                                    className="rfq-input",
-                                                    placeholder="e.g., 2500",
-                                                    type="text",
-                                                    id="rfq-qty-derivatives",
+                                                dcc.Checklist(
+                                                    options=[{"label": "Solve", "value": "solve"}],
+                                                    value=[],
+                                                    id="rfq-barrier-solve-derivatives",
                                                 ),
                                             ],
                                         ),
-                                        html.Div(
-                                            className="rfq-form-field",
-                                            children=[
-                                                html.Div(
-                                                    "Volume (optional)",
-                                                    className="rfq-form-label",
-                                                ),
-                                                dcc.Input(
-                                                    className="rfq-input",
-                                                    placeholder="e.g., 1000",
-                                                    type="text",
-                                                    id="rfq-volume-derivatives",
-                                                ),
+                                    ],
+                                ),
+                                html.Div(
+                                    className="rfq-form-field rfq-leg-barrier-type",
+                                    children=[
+                                        html.Div("Barrier Type", className="rfq-form-label"),
+                                        dcc.Dropdown(
+                                            className="rfq-input rfq-select",
+                                            options=[
+                                                {"label": "No Barrier", "value": "No Barrier"},
+                                                {"label": "Up-and-Out", "value": "Up-and-Out"},
+                                                {"label": "Down-and-Out", "value": "Down-and-Out"},
+                                                {"label": "Up-and-In", "value": "Up-and-In"},
+                                                {"label": "Down-and-In", "value": "Down-and-In"},
                                             ],
+                                            value="No Barrier",
+                                            clearable=False,
+                                            maxHeight=420,
+                                            id="rfq-barrier-type-derivatives",
                                         ),
                                     ],
                                 ),
@@ -1723,8 +1819,6 @@ def switch_rfq_tab(active_tab, _refresh, show_active):
         rows = load_rfq_rows(rfq_class, counterparties, show_active=bool(show_active))
         label = "Create Sovereign RFQ"
     columns = build_rfq_columns(counterparties)
-    if active_tab == "derivatives":
-        columns = [col for col in columns if col.get("field") != "requester"]
     if not show_active:
         for col in columns:
             if col.get("field", "").startswith("cp_"):
@@ -1759,8 +1853,11 @@ def switch_rfq_tab(active_tab, _refresh, show_active):
     State("rfq-quote-type-derivatives", "value"),
     State("rfq-bond-name-derivatives", "value"),
     State("rfq-maturity-derivatives", "value"),
+    State("rfq-maturity-unit-derivatives", "value"),
     State("rfq-qty-derivatives", "value"),
     State("rfq-volume-derivatives", "value"),
+    State("rfq-limit-derivatives", "value"),
+    State("rfq-requester-derivatives", "value"),
     State("current-user", "data"),
     State("rfq-refresh", "data"),
     prevent_initial_call=True,
@@ -1790,8 +1887,11 @@ def submit_rfq(
     quote_type_derivatives,
     bond_name_derivatives,
     maturity_derivatives,
+    maturity_unit_derivatives,
     qty_derivatives,
     volume_derivatives,
+    limit_derivatives,
+    requester_derivatives,
     current_user,
     refresh_value,
 ):
@@ -1802,8 +1902,8 @@ def submit_rfq(
         asset_class = "Sovereign Bond"
         direction = direction_sovereign
         quote_type = quote_type_sovereign
-        bond_name = bond_name_sovereign
-        maturity = maturity_sovereign
+        bond_name = maturity_sovereign
+        maturity = load_security_maturity(maturity_sovereign)
         qty = qty_sovereign
         volume = volume_sovereign
         limit_value = limit_sovereign
@@ -1827,11 +1927,15 @@ def submit_rfq(
         direction = direction_derivatives
         quote_type = quote_type_derivatives
         bond_name = bond_name_derivatives
-        maturity = maturity_derivatives
+        maturity = (
+            f"{str(maturity_derivatives).strip()}{maturity_unit_derivatives}"
+            if maturity_derivatives not in (None, "")
+            else maturity_derivatives
+        )
         qty = qty_derivatives
         volume = volume_derivatives
-        limit_value = None
-        requester = None
+        limit_value = limit_derivatives
+        requester = requester_derivatives
     else:
         raise PreventUpdate
 
@@ -1858,13 +1962,22 @@ def submit_rfq(
     ):
         validation_errors.append("Quote requester must be selected.")
 
+    if asset_class == "Derivatives" and not requester_text:
+        validation_errors.append("Quote requester must be selected.")
+
     if asset_class in ("Sovereign Bond", "Derivatives") and not maturity_text:
         validation_errors.append("Maturity date must be selected.")
 
+    if asset_class == "Derivatives" and not limit_text:
+        validation_errors.append("Premium must be filled.")
+
     if not qty_text and not volume_text:
-        validation_errors.append(
-            "Fill Quantity or Volume before creating the RFQ."
-        )
+        if asset_class == "Derivatives":
+            validation_errors.append("Fill Notional before creating the RFQ.")
+        else:
+            validation_errors.append(
+                "Fill Quantity or Volume before creating the RFQ."
+            )
 
     if qty_text and qty_parsed is None:
         validation_errors.append("Quantity must be a positive number or empty.")
@@ -1872,14 +1985,18 @@ def submit_rfq(
         validation_errors.append("Quantity must be greater than zero.")
 
     if volume_text and volume_parsed is None:
-        validation_errors.append("Volume must be a positive number or empty.")
+        volume_label = "Notional" if asset_class == "Derivatives" else "Volume"
+        validation_errors.append(f"{volume_label} must be a positive number or empty.")
     elif volume_parsed is not None and volume_parsed <= 0:
-        validation_errors.append("Volume must be greater than zero.")
+        volume_label = "Notional" if asset_class == "Derivatives" else "Volume"
+        validation_errors.append(f"{volume_label} must be greater than zero.")
 
     if limit_text and limit_parsed is None:
-        validation_errors.append("Yield limit must be a positive number or empty.")
+        limit_label = "Premium" if asset_class == "Derivatives" else "Yield limit"
+        validation_errors.append(f"{limit_label} must be a positive number or empty.")
     elif limit_parsed is not None and limit_parsed <= 0:
-        validation_errors.append("Yield limit must be greater than zero.")
+        limit_label = "Premium" if asset_class == "Derivatives" else "Yield limit"
+        validation_errors.append(f"{limit_label} must be greater than zero.")
 
     if validation_errors:
         notification_prefix = datetime.now().strftime("%Y%m%d%H%M%S%f")
@@ -1906,7 +2023,7 @@ def submit_rfq(
     if asset_class in ("Corporate Bond", "Sovereign Bond"):
         requester = requester_text if quote_type == "Mkt Color" else None
     else:
-        requester = None
+        requester = requester_text
 
     try:
         with sqlite3.connect(DATABASE_PATH) as conn:
@@ -2151,52 +2268,11 @@ def handle_rfq_action(
     return no_update, copy_text, (copy_clicks or 0) + 1
 
 
-@callback(
-    Output("rfq-grid-clipboard", "content"),
-    Output("rfq-grid-clipboard", "n_clicks"),
+clientside_callback(
+    ClientsideFunction(namespace="rfq", function_name="copyGridToClipboard"),
+    Output("rfq-grid-copy-result", "data"),
     Input("rfq-copy-grid-btn", "n_clicks"),
     State("rfq-grid", "rowData"),
     State("rfq-grid", "columnDefs"),
-    State("rfq-grid-clipboard", "n_clicks"),
     prevent_initial_call=True,
 )
-def copy_grid_to_clipboard(
-    copy_clicks,
-    row_data,
-    column_defs,
-    clipboard_clicks,
-):
-    if not copy_clicks:
-        raise PreventUpdate
-    if not row_data or not column_defs:
-        raise PreventUpdate
-
-    visible_cols = []
-    for col in column_defs:
-        field = col.get("field")
-        if not field:
-            continue
-        if col.get("hide"):
-            continue
-        if field == "actions":
-            continue
-        visible_cols.append((field, col.get("headerName") or field))
-
-    if not visible_cols:
-        raise PreventUpdate
-
-    def _clean_value(value):
-        if value is None:
-            return ""
-        text = str(value)
-        text = text.replace("\r", " ").replace("\n", " ").replace("\t", " ")
-        return text.strip()
-
-    lines = []
-    lines.append("\t".join([header for _, header in visible_cols]))
-    for row in row_data:
-        line = "\t".join([_clean_value(row.get(field)) for field, _ in visible_cols])
-        lines.append(line)
-
-    content = "\n".join(lines)
-    return content, (clipboard_clicks or 0) + 1

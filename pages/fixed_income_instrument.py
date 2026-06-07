@@ -216,35 +216,63 @@ def _format_volume_compact(value):
     return f"{value:.0f}"
 
 
-def load_characteristics_timeseries_df(selected_security, time_range):
-    empty_df = pd.DataFrame()
-    if not selected_security or not DATABASE_PATH.exists():
-        return empty_df, empty_df, pd.DatetimeIndex([])
+def _load_sqlite_dataframe(query, params=()):
+    if not DATABASE_PATH.exists():
+        return pd.DataFrame()
+    try:
+        with sqlite3.connect(DATABASE_PATH) as conn:
+            return pd.read_sql(query, conn, params=params)
+    except sqlite3.Error:
+        return pd.DataFrame()
 
-    with sqlite3.connect(DATABASE_PATH) as conn:
-        base_df = pd.read_sql(
-            """
-            select
-                DT_REF,
-                NM_SECURITY,
-                VL_SPREAD_BID * 100.0 as VL_SPREAD_BID,
-                VL_SPREAD_ASK * 100.0 as VL_SPREAD_ASK,
-                VL_BASE_YIELD,
-                VL_DURATION,
-                VL_TRADED,
-                DT_INPUT
-            from FIXED_INCOME_MARKET_DATA
-            where NM_SECURITY = ?
-            """,
-            conn,
-            params=(selected_security,),
-        )
 
-    if base_df.empty:
-        return base_df, base_df, pd.DatetimeIndex([])
+def load_security_classification_df(selected_security=None):
+    query = """
+        SELECT
+            ID_SECURITY,
+            NM_SECURITY,
+            NM_ISSUER,
+            DT_MATURITY,
+            NM_INDEX
+        FROM FIXED_INCOME_SECURITY_CLASSIFICATION
+    """
+    params = ()
+    if selected_security:
+        query += " WHERE NM_SECURITY = ?"
+        params = (selected_security,)
+    df = _load_sqlite_dataframe(query, params)
+    if df.empty:
+        return df
+    if "DT_MATURITY" in df.columns:
+        df["DT_MATURITY"] = df["DT_MATURITY"].fillna("").astype(str).str.strip()
+    for column_name in ["NM_SECURITY", "NM_ISSUER", "NM_INDEX"]:
+        if column_name in df.columns:
+            df[column_name] = df[column_name].fillna("").astype(str).str.strip()
+    return df
 
-    base_df["DT_REF"] = pd.to_datetime(base_df["DT_REF"], errors="coerce")
-    base_df["DT_INPUT"] = pd.to_datetime(base_df["DT_INPUT"], errors="coerce")
+
+def load_market_data_df(selected_security=None):
+    query = """
+        SELECT
+            DT_REF,
+            NM_SECURITY,
+            VL_SPREAD_BID,
+            VL_SPREAD_ASK,
+            VL_BASE_YIELD,
+            VL_DURATION,
+            VL_TRADED,
+            DT_INPUT
+        FROM FIXED_INCOME_MARKET_DATA
+    """
+    params = ()
+    if selected_security:
+        query += " WHERE NM_SECURITY = ?"
+        params = (selected_security,)
+    df = _load_sqlite_dataframe(query, params)
+    if df.empty:
+        return df
+    df["DT_REF"] = pd.to_datetime(df["DT_REF"], errors="coerce")
+    df["DT_INPUT"] = pd.to_datetime(df["DT_INPUT"], errors="coerce")
     for numeric_col in [
         "VL_SPREAD_BID",
         "VL_SPREAD_ASK",
@@ -252,7 +280,82 @@ def load_characteristics_timeseries_df(selected_security, time_range):
         "VL_DURATION",
         "VL_TRADED",
     ]:
-        base_df[numeric_col] = pd.to_numeric(base_df[numeric_col], errors="coerce")
+        df[numeric_col] = pd.to_numeric(df[numeric_col], errors="coerce")
+    df["VL_SPREAD_BID"] = df["VL_SPREAD_BID"] * 100.0
+    df["VL_SPREAD_ASK"] = df["VL_SPREAD_ASK"] * 100.0
+    df["NM_SECURITY"] = df["NM_SECURITY"].fillna("").astype(str).str.strip()
+    return df
+
+
+def load_broker_data_df(selected_security=None):
+    query = """
+        SELECT
+            DT_REF,
+            NM_SECURITY,
+            NM_SOURCE,
+            NM_BROKER,
+            SIDE,
+            TX_QUOTE,
+            VL_QUOTE,
+            DT_INPUT,
+            USR_INPUT
+        FROM FIXED_INCOME_BROKER_DATA
+    """
+    params = ()
+    if selected_security:
+        query += " WHERE NM_SECURITY = ?"
+        params = (selected_security,)
+    df = _load_sqlite_dataframe(query, params)
+    if df.empty:
+        return df
+    df["DT_REF"] = pd.to_datetime(df["DT_REF"], errors="coerce")
+    df["DT_INPUT"] = pd.to_datetime(df["DT_INPUT"], errors="coerce")
+    for numeric_col in ["TX_QUOTE", "VL_QUOTE"]:
+        df[numeric_col] = pd.to_numeric(df[numeric_col], errors="coerce")
+    for column_name in ["NM_SECURITY", "NM_SOURCE", "NM_BROKER", "SIDE", "USR_INPUT"]:
+        if column_name in df.columns:
+            df[column_name] = df[column_name].fillna("").astype(str).str.strip()
+    return df
+
+
+def load_rfq_table_df(selected_security=None):
+    query = """
+        SELECT
+            RFQ_ID,
+            DT_INPUT,
+            USR_INPUT,
+            DIRECTION,
+            SEC_NAME,
+            QTY,
+            VOLUME,
+            STR_RESPONSE
+        FROM RFQ
+    """
+    params = ()
+    if selected_security:
+        query += " WHERE SEC_NAME = ?"
+        params = (selected_security,)
+    df = _load_sqlite_dataframe(query, params)
+    if df.empty:
+        return df
+    df["DT_INPUT"] = pd.to_datetime(df["DT_INPUT"], errors="coerce")
+    for numeric_col in ["QTY", "VOLUME"]:
+        df[numeric_col] = pd.to_numeric(df[numeric_col], errors="coerce")
+    for column_name in ["USR_INPUT", "DIRECTION", "SEC_NAME", "STR_RESPONSE"]:
+        if column_name in df.columns:
+            df[column_name] = df[column_name].fillna("").astype(str).str.strip()
+    return df
+
+
+def load_characteristics_timeseries_df(selected_security, time_range):
+    empty_df = pd.DataFrame()
+    if not selected_security or not DATABASE_PATH.exists():
+        return empty_df, empty_df, pd.DatetimeIndex([])
+
+    base_df = load_market_data_df(selected_security)
+    if base_df.empty:
+        return base_df, base_df, pd.DatetimeIndex([])
+
     base_df = base_df.dropna(subset=["DT_REF"])
 
     if base_df.empty:
@@ -322,62 +425,12 @@ def load_kpi_metrics(selected_security, time_range):
         "avg_volume": _format_volume_compact(avg_volume),
     }
 
-def load_trades_df(selected_security, time_range):
-    _, trades_df, _ = load_characteristics_timeseries_df(selected_security, time_range)
-    if trades_df.empty:
-        return trades_df
-    return trades_df[
-        [
-            "DT_REF",
-            "NM_SECURITY",
-            "VL_SPREAD_BID",
-            "VL_SPREAD_ASK",
-            "VL_TRADED",
-        ]
-    ].copy()
-
-
 def load_grid_trades_df(selected_security, time_range):
     if not selected_security or not DATABASE_PATH.exists():
         return pd.DataFrame()
 
-    with sqlite3.connect(DATABASE_PATH) as conn:
-        broker_df = pd.read_sql(
-            """
-            select
-                DT_REF,
-                NM_SECURITY,
-                NM_SOURCE,
-                NM_BROKER,
-                SIDE,
-                TX_QUOTE,
-                VL_QUOTE,
-                DT_INPUT,
-                USR_INPUT
-            from FIXED_INCOME_BROKER_DATA
-            where NM_SECURITY = ?
-            """,
-            conn,
-            params=(selected_security,),
-        )
-
-        rfq_df = pd.read_sql(
-            """
-            select
-                RFQ_ID,
-                DT_INPUT,
-                USR_INPUT,
-                DIRECTION,
-                SEC_NAME,
-                QTY,
-                VOLUME,
-                STR_RESPONSE
-            from RFQ
-            where SEC_NAME = ?
-            """,
-            conn,
-            params=(selected_security,),
-        )
+    broker_df = load_broker_data_df(selected_security)
+    rfq_df = load_rfq_table_df(selected_security)
 
     def _parse_response_payload(payload):
         if not payload:
@@ -469,7 +522,7 @@ def load_grid_trades_df(selected_security, time_range):
 
                     rfq_quotes_df = pd.DataFrame(
                         {
-                            "DT_REF": dt_ref_series.dt.date.astype(str),
+                            "DT_REF": dt_ref_series.dt.normalize(),
                             "NM_SECURITY": rfq_expanded_df["SEC_NAME"],
                             "NM_SOURCE": "Trader",
                             "NM_BROKER": rfq_expanded_df["broker name"],
@@ -493,7 +546,6 @@ def load_grid_trades_df(selected_security, time_range):
     if trades_df.empty:
         return trades_df
 
-    trades_df["DT_REF"] = pd.to_datetime(trades_df["DT_REF"], errors="coerce")
     trades_df = trades_df.dropna(subset=["DT_REF"])
 
     end_date = pd.Timestamp.today().normalize()
@@ -704,36 +756,18 @@ layout = dbc.Container(
 )
 def refresh_instrument_dropdown(_):
     options = []
-    if DATABASE_PATH.exists():
-        try:
-            with sqlite3.connect(DATABASE_PATH) as conn:
-                df = pd.read_sql(
-                    """
-                    select
-                        sc.NM_SECURITY,
-                        sc.NM_ISSUER,
-                        sc.DT_MATURITY,
-                        sc.NM_INDEX
-                    from FIXED_INCOME_SECURITY_CLASSIFICATION sc
-                    where sc.NM_SECURITY is not null and trim(sc.NM_SECURITY) <> ''
-                    order by sc.NM_SECURITY
-                    """,
-                    conn,
-                )
-            if not df.empty:
-                for _, row in df.iterrows():
-                    issuer = row["NM_ISSUER"] if pd.notna(row["NM_ISSUER"]) else "--"
-                    maturity = (
-                        row["DT_MATURITY"] if pd.notna(row["DT_MATURITY"]) else "--"
-                    )
-                    index_name = row["NM_INDEX"] if pd.notna(row["NM_INDEX"]) else "--"
-                    label = (
-                        f"{row['NM_SECURITY']} | {issuer} | "
-                        f"{maturity} | {index_name}"
-                    )
-                    options.append({"label": label, "value": row["NM_SECURITY"]})
-        except Exception:
-            options = []
+    df = load_security_classification_df()
+    if not df.empty:
+        df = df.loc[df["NM_SECURITY"] != ""].sort_values("NM_SECURITY")
+        for _, row in df.iterrows():
+            issuer = row["NM_ISSUER"] or "--"
+            maturity = row["DT_MATURITY"] or "--"
+            index_name = row["NM_INDEX"] or "--"
+            label = (
+                f"{row['NM_SECURITY']} | {issuer} | "
+                f"{maturity} | {index_name}"
+            )
+            options.append({"label": label, "value": row["NM_SECURITY"]})
     value = options[0]["value"] if options else None
     return options, value
 
@@ -759,7 +793,18 @@ def update_kpi_cards(selected_security, time_range):
 
 
 def build_spread_volume_options(selected_security, time_range):
-    trade_df = load_trades_df(selected_security, time_range)
+    _, trade_df, _ = load_characteristics_timeseries_df(selected_security, time_range)
+    if not trade_df.empty:
+        trade_df = trade_df[
+            [
+                "DT_REF",
+                "NM_SECURITY",
+                "VL_SPREAD_BID",
+                "VL_SPREAD_ASK",
+                "VL_TRADED",
+            ]
+        ].copy()
+    quote_df = load_grid_trades_df(selected_security, time_range)
     calendar_index = load_brazil_business_days(time_range)
     calendar_index = (
         pd.DatetimeIndex(calendar_index.dropna().drop_duplicates()).sort_values()
@@ -770,6 +815,11 @@ def build_spread_volume_options(selected_security, time_range):
     ]
     subtitle_options = {"text": "No trades found for the selected instrument", "align": "center", "style": {"color": "#64748b", "fontSize": "13px"}}
     series = []
+    volume_data = []
+    bid_data = []
+    ask_data = []
+    quote_series = []
+    quote_activity_by_index = {}
 
     if not trade_df.empty:
         trade_df["DT_REF"] = pd.to_datetime(trade_df["DT_REF"], errors="coerce")
@@ -830,6 +880,102 @@ def build_spread_volume_options(selected_security, time_range):
             ]
 
             subtitle_options = {"text": None}
+
+    if not quote_df.empty and len(categories) > 0:
+        quote_df["DT_REF"] = pd.to_datetime(quote_df["DT_REF"], errors="coerce")
+        quote_df["TX_QUOTE"] = pd.to_numeric(quote_df["TX_QUOTE"], errors="coerce")
+        quote_df["DT_INPUT"] = pd.to_datetime(quote_df["DT_INPUT"], errors="coerce")
+        quote_df["SIDE"] = quote_df["SIDE"].astype(str).str.strip().str.lower()
+        quote_df["NM_BROKER"] = quote_df["NM_BROKER"].fillna("--").astype(str).str.strip()
+        quote_df = quote_df.dropna(subset=["DT_REF", "TX_QUOTE"])
+        quote_df["DT_REF"] = quote_df["DT_REF"].dt.normalize()
+        quote_df = quote_df.loc[quote_df["SIDE"].isin(["bid", "ask"])]
+
+        date_to_x = {
+            pd.Timestamp(dt_ref).normalize(): idx
+            for idx, dt_ref in enumerate(calendar_index)
+        }
+
+        if date_to_x:
+            quote_df = quote_df.loc[quote_df["DT_REF"].isin(date_to_x.keys())].copy()
+            if not quote_df.empty:
+                latest_quote_df = (
+                    quote_df.sort_values(["DT_REF", "SIDE", "NM_BROKER", "DT_INPUT"])
+                    .groupby(["DT_REF", "SIDE", "NM_BROKER"], as_index=False)
+                    .tail(1)
+                )
+
+                for dt_ref, date_df in latest_quote_df.groupby("DT_REF"):
+                    x_idx = date_to_x.get(pd.Timestamp(dt_ref).normalize())
+                    if x_idx is None:
+                        continue
+                    quote_activity_by_index[int(x_idx)] = {
+                        "bid": [
+                            {
+                                "broker": row["NM_BROKER"],
+                                "quote": round(float(row["TX_QUOTE"]), 3),
+                                "source": str(row.get("NM_SOURCE") or "--"),
+                            }
+                            for _, row in date_df.loc[
+                                date_df["SIDE"] == "bid"
+                            ]
+                            .sort_values(["TX_QUOTE", "NM_BROKER"], ascending=[False, True])
+                            .iterrows()
+                        ],
+                        "ask": [
+                            {
+                                "broker": row["NM_BROKER"],
+                                "quote": round(float(row["TX_QUOTE"]), 3),
+                                "source": str(row.get("NM_SOURCE") or "--"),
+                            }
+                            for _, row in date_df.loc[
+                                date_df["SIDE"] == "ask"
+                            ]
+                            .sort_values(["TX_QUOTE", "NM_BROKER"], ascending=[True, True])
+                            .iterrows()
+                        ],
+                    }
+
+                for side_key, side_label, side_color in [
+                    ("bid", "Bid", "#16a34a"),
+                    ("ask", "Ask", "#f97316"),
+                ]:
+                    side_df = latest_quote_df.loc[
+                        latest_quote_df["SIDE"] == side_key
+                    ].copy()
+                    if side_df.empty:
+                        continue
+                    for broker_name, broker_df in side_df.groupby("NM_BROKER"):
+                        data = [None] * len(categories)
+                        for _, row in broker_df.iterrows():
+                            x_idx = date_to_x.get(row["DT_REF"])
+                            if x_idx is None:
+                                continue
+                            data[x_idx] = round(float(row["TX_QUOTE"]), 3)
+                        if all(value is None for value in data):
+                            continue
+                        quote_series.append(
+                            {
+                                "type": "scatter",
+                                "name": f"{side_label} - {broker_name}",
+                                "data": data,
+                                "color": side_color,
+                                "yAxis": 0,
+                                "showInLegend": False,
+                                "marker": {
+                                    "enabled": True,
+                                    "radius": 3,
+                                    "symbol": "circle",
+                                },
+                                "tooltip": {
+                                    "pointFormat": (
+                                        "<span style=\"color:{series.color}\">\u25CF</span> "
+                                        f"{side_label} - {broker_name}: "
+                                        "<b>{point.y:.3f}</b><br/>"
+                                    )
+                                },
+                            }
+                        )
 
     point_count = len(categories) if categories else 1
     hover_band_width = int(max(20, min(180, round(1200 / point_count))))
@@ -895,6 +1041,9 @@ def build_spread_volume_options(selected_security, time_range):
             "borderRadius": 8,
             "shadow": True,
         },
+        "custom": {
+            "quoteActivityByIndex": quote_activity_by_index,
+        },
         "plotOptions": {
             "series": {"animation": {"duration": 900}},
             "column": {
@@ -937,6 +1086,7 @@ def build_spread_volume_options(selected_security, time_range):
                     "connectNulls": False,
                     "tooltip": {"valueDecimals": 3},
                 },
+                *quote_series,
             ],
     }
 

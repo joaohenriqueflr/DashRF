@@ -240,6 +240,117 @@ window.dashAgGridFunctions.rfqLimitHighlight = function (params) {
     return dagcomponentfuncs.RfqLimitHighlight(params);
 };
 
+(function () {
+    var dc = (window.dash_clientside = window.dash_clientside || {});
+    dc.rfq = dc.rfq || {};
+
+    function getVisibleColumns(columnDefs) {
+        if (!Array.isArray(columnDefs)) {
+            return [];
+        }
+        var columns = [];
+        columnDefs.forEach(function (col) {
+            var field = col && col.field;
+            if (!field || col.hide || field === "actions") {
+                return;
+            }
+            columns.push({
+                field: field,
+                headerName: col.headerName || field,
+            });
+        });
+        return columns;
+    }
+
+    function cleanGridValue(value, field) {
+        if (value === null || value === undefined || value === "--") {
+            return "";
+        }
+        var text = value.toString();
+        if (field && field.indexOf("cp_") === 0) {
+            var parts = text.split("|");
+            var quote = (parts[0] || "").trim();
+            var time = (parts[1] || "").trim();
+            text = time ? quote + " " + time : quote;
+        }
+        return text.replace(/[\r\n\t]+/g, " ").trim();
+    }
+
+    function buildGridTsv(rowData, columnDefs) {
+        var columns = getVisibleColumns(columnDefs);
+        if (!Array.isArray(rowData) || !rowData.length || !columns.length) {
+            return "";
+        }
+        var lines = [
+            columns
+                .map(function (col) {
+                    return cleanGridValue(col.headerName, col.field);
+                })
+                .join("\t"),
+        ];
+        rowData.forEach(function (row) {
+            lines.push(
+                columns
+                    .map(function (col) {
+                        return cleanGridValue(row ? row[col.field] : "", col.field);
+                    })
+                    .join("\t")
+            );
+        });
+        return lines.join("\r\n");
+    }
+
+    function fallbackCopy(text) {
+        var textarea = document.createElement("textarea");
+        textarea.value = text;
+        textarea.setAttribute("readonly", "");
+        textarea.style.position = "fixed";
+        textarea.style.left = "-9999px";
+        textarea.style.top = "0";
+        document.body.appendChild(textarea);
+        textarea.select();
+        try {
+            document.execCommand("copy");
+        } finally {
+            document.body.removeChild(textarea);
+        }
+    }
+
+    function copyText(text) {
+        if (
+            window.navigator &&
+            window.navigator.clipboard &&
+            typeof window.navigator.clipboard.writeText === "function"
+        ) {
+            window.navigator.clipboard.writeText(text).catch(function () {
+                fallbackCopy(text);
+            });
+            return;
+        }
+        fallbackCopy(text);
+    }
+
+    dc.rfq.copyGridToClipboard = function (nClicks, rowData, columnDefs) {
+        if (!nClicks) {
+            return window.dash_clientside.no_update;
+        }
+        var text = buildGridTsv(rowData, columnDefs);
+        if (!text) {
+            return {
+                copied: false,
+                rows: 0,
+                timestamp: Date.now(),
+            };
+        }
+        copyText(text);
+        return {
+            copied: true,
+            rows: Array.isArray(rowData) ? rowData.length : 0,
+            timestamp: Date.now(),
+        };
+    };
+})();
+
 dagcomponentfuncs.RfqActionsCell = function (props) {
     return React.createElement(
         "div",

@@ -98,6 +98,85 @@
         if (!options) {
             return window.dash_clientside.no_update;
         }
+        options.tooltip = options.tooltip || {};
+        options.tooltip.useHTML = true;
+        options.tooltip.formatter = function () {
+            var pointList = this.points || (this.point ? [this.point] : []);
+            var lines = [];
+            var categoryLabel = this.x;
+            var xIndex = null;
+            var i;
+
+            if (pointList.length && pointList[0].point && typeof pointList[0].point.x !== "undefined") {
+                xIndex = String(pointList[0].point.x);
+                var categoryIndex = pointList[0].point.x;
+                var axisCategories =
+                    this.series &&
+                    this.series.chart &&
+                    this.series.chart.xAxis &&
+                    this.series.chart.xAxis[0] &&
+                    this.series.chart.xAxis[0].categories;
+                if (
+                    axisCategories &&
+                    typeof categoryIndex !== "undefined" &&
+                    axisCategories[categoryIndex] !== undefined
+                ) {
+                    categoryLabel = axisCategories[categoryIndex];
+                }
+            }
+
+            lines.push("<div style=\"font-size:12px;color:#0f172a;line-height:1.4;\">");
+            lines.push("<div style=\"font-weight:700;margin-bottom:6px;\">" + categoryLabel + "</div>");
+
+            for (i = 0; i < pointList.length; i += 1) {
+                var point = pointList[i];
+                if (!point || !point.series) {
+                    continue;
+                }
+                if (point.series.type === "scatter") {
+                    continue;
+                }
+                var valueText = "";
+                if (point.series.name === "Daily Volume") {
+                    valueText = window.Highcharts.numberFormat(point.y || 0, 2) + "M";
+                } else {
+                    valueText = window.Highcharts.numberFormat(point.y || 0, 3);
+                }
+                lines.push(
+                    "<div><span style=\"color:" + point.color + ";\">&#9679;</span> " +
+                    point.series.name + ": <b>" + valueText + "</b></div>"
+                );
+            }
+
+            var custom = (this.series && this.series.chart && this.series.chart.options && this.series.chart.options.custom) || {};
+            var quoteActivityByIndex = custom.quoteActivityByIndex || {};
+            var quoteActivity = xIndex !== null ? quoteActivityByIndex[xIndex] : null;
+
+            function renderQuoteBlock(title, color, rows) {
+                var j;
+                if (!rows || !rows.length) {
+                    return;
+                }
+                lines.push(
+                    "<div style=\"margin-top:8px;font-weight:700;color:" + color + ";\">" + title + "</div>"
+                );
+                for (j = 0; j < rows.length; j += 1) {
+                    var row = rows[j];
+                    lines.push(
+                        "<div style=\"padding-left:10px;\">" +
+                        row.broker + ": <b>" + window.Highcharts.numberFormat(row.quote || 0, 3) + "</b></div>"
+                    );
+                }
+            }
+
+            if (quoteActivity) {
+                renderQuoteBlock("Bid Quotes", "#16a34a", quoteActivity.bid);
+                renderQuoteBlock("Ask Quotes", "#f97316", quoteActivity.ask);
+            }
+
+            lines.push("</div>");
+            return lines.join("");
+        };
         renderSpecificChart("spread-volume-chart", options);
         return window.dash_clientside.no_update;
     };

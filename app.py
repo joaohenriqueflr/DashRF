@@ -8,6 +8,7 @@ import dash_mantine_components as dmc
 app = Dash(
     __name__,
     use_pages=True,
+    title="Unified Global Markets",
     external_stylesheets=[dbc.themes.BOOTSTRAP],
     external_scripts=[
         "https://code.highcharts.com/highcharts.js",
@@ -15,6 +16,26 @@ app = Dash(
     ],
     suppress_callback_exceptions=True,
 )
+
+app.index_string = """
+<!DOCTYPE html>
+<html>
+    <head>
+        {%metas%}
+        <title>{%title%}</title>
+        <link rel="icon" type="image/png" href="/assets/ubs-logo.png">
+        {%css%}
+    </head>
+    <body>
+        {%app_entry%}
+        <footer>
+            {%config%}
+            {%scripts%}
+            {%renderer%}
+        </footer>
+    </body>
+</html>
+"""
 
 top_nav = html.Div(
     className="top-nav",
