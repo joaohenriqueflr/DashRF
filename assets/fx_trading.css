@@ -1,0 +1,703 @@
+/* ---------- FX TRADING PAGE ---------- */
+
+.fx-page {
+    background: transparent;
+}
+
+.fx-page-header {
+    margin-bottom: 26px;
+}
+
+.fx-page-title {
+    color: #111827;
+    font-family: var(--font-heading);
+    font-size: 20px;
+    font-weight: 700;
+    margin: 0 0 6px;
+}
+
+.fx-page-subtitle {
+    color: #667085;
+    font-size: 14px;
+    font-weight: 500;
+}
+
+.fx-stepper-card,
+.fx-card {
+    background: #ffffff;
+    border: 1px solid #dfe4ec;
+    border-radius: 4px;
+}
+
+.fx-stepper-card {
+    margin-bottom: 26px;
+    padding: 22px 24px;
+}
+
+.fx-stepper {
+    width: 100%;
+}
+
+.fx-stepper .mantine-Stepper-separator {
+    background-color: #d9dee7;
+    border-top-color: #d9dee7;
+    margin-left: 24px;
+    margin-right: 24px;
+}
+
+.fx-stepper .mantine-Stepper-separator[data-active],
+.fx-stepper .mantine-Stepper-step[data-completed] + .mantine-Stepper-separator {
+    background-color: #35c184 !important;
+    border-top-color: #35c184 !important;
+}
+
+.fx-stepper .mantine-Stepper-step {
+    min-width: 230px;
+}
+
+.fx-stepper .mantine-Stepper-stepIcon {
+    box-shadow: 0 5px 12px rgba(37, 99, 235, 0.25);
+    font-size: 12px;
+    font-weight: 800;
+    text-transform: uppercase;
+}
+
+.fx-stepper .mantine-Stepper-stepIcon[data-completed] {
+    background: #3cc186;
+    border-color: #3cc186;
+    box-shadow: none;
+}
+
+.fx-stepper .mantine-Stepper-stepIcon[data-progress] {
+    background: #2f5df5;
+    border-color: #2f5df5;
+    box-shadow: 0 5px 12px rgba(37, 99, 235, 0.25);
+}
+
+.fx-stepper .mantine-Stepper-stepLabel {
+    color: #98a2b3;
+    font-size: 14px;
+    font-weight: 800;
+    line-height: 1.15;
+}
+
+.fx-stepper .mantine-Stepper-step[data-progress] .mantine-Stepper-stepLabel,
+.fx-stepper .mantine-Stepper-stepIcon[data-progress] + .mantine-Stepper-stepBody .mantine-Stepper-stepLabel {
+    color: #2563eb !important;
+}
+
+.fx-stepper .mantine-Stepper-step[data-completed] .mantine-Stepper-stepLabel,
+.fx-stepper .mantine-Stepper-stepIcon[data-completed] + .mantine-Stepper-stepBody .mantine-Stepper-stepLabel {
+    color: #147a55 !important;
+}
+
+.fx-stepper-icon {
+    color: #98a2b3;
+    display: block;
+    height: 26px;
+    width: 26px;
+}
+
+.fx-stepper .mantine-Stepper-stepIcon[data-progress] .fx-stepper-icon,
+.fx-stepper .mantine-Stepper-stepIcon[data-completed] .fx-stepper-icon {
+    color: #ffffff;
+}
+
+.fx-stepper .mantine-Stepper-stepDescription {
+    color: #98a2b3;
+    font-size: 12px;
+    font-weight: 700;
+    line-height: 1.2;
+    max-width: 250px;
+}
+
+.fx-card {
+    overflow: hidden;
+}
+
+.fx-card-title {
+    color: #1f2937;
+    font-size: 14px;
+    font-weight: 800;
+}
+
+.fx-card-header {
+    align-items: center;
+    border-bottom: 1px solid #edf0f5;
+    display: flex;
+    justify-content: space-between;
+    min-height: 45px;
+    padding: 0 20px;
+}
+
+.fx-card-count {
+    align-items: center;
+    color: #8a95a7;
+    display: flex;
+    font-size: 12px;
+    gap: 12px;
+}
+
+.fx-approval-layout {
+    display: grid;
+    gap: 24px;
+    grid-template-columns: minmax(320px, 0.66fr) minmax(520px, 1fr);
+}
+
+.fx-submit-card {
+    padding: 20px;
+}
+
+.fx-submit-card .fx-card-title {
+    margin-bottom: 18px;
+}
+
+.fx-field {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-width: 0;
+}
+
+.fx-field + .fx-field {
+    margin-top: 12px;
+}
+
+.fx-label,
+.fx-notional-label {
+    color: #667085;
+    font-size: 12px;
+    font-weight: 800;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+.fx-input {
+    background: #ffffff;
+    border: 1px solid #cfd6e1;
+    border-radius: 4px;
+    color: #111827;
+    font-size: 14px;
+    height: 38px;
+    padding: 8px 12px;
+    width: 100%;
+}
+
+.fx-input:disabled {
+    background: #f8fafc;
+    color: #98a2b3;
+}
+
+.fx-input:focus,
+.fx-currency-field:focus {
+    border-color: #7aa7ff;
+    box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.12);
+    outline: none;
+}
+
+.fx-textarea {
+    height: 78px;
+    min-height: 78px;
+    resize: vertical;
+}
+
+.fx-select .Select-control,
+.fx-mini-select .Select-control {
+    border: 1px solid #cfd6e1;
+    border-radius: 4px;
+    box-shadow: none;
+    min-height: 38px;
+}
+
+.fx-select .Select-placeholder,
+.fx-select .Select-value-label,
+.fx-mini-select .Select-placeholder,
+.fx-mini-select .Select-value-label {
+    color: #111827;
+    line-height: 36px;
+    padding-left: 3px;
+}
+
+.fx-select .Select-input,
+.fx-mini-select .Select-input {
+    height: 36px;
+}
+
+.fx-select .Select-menu-outer,
+.fx-mini-select .Select-menu-outer {
+    border: 1px solid #cfd6e1;
+    border-radius: 4px;
+    box-shadow: 0 10px 22px rgba(15, 23, 42, 0.12);
+}
+
+.fx-upload {
+    align-items: center;
+    border: 2px dashed #cbd5e1;
+    color: #667085;
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    font-size: 12px;
+    font-weight: 700;
+    height: 95px;
+    justify-content: center;
+    transition: background 0.2s ease, border-color 0.2s ease;
+}
+
+.fx-upload:hover {
+    background: #f8fafc;
+    border-color: #94a3b8;
+}
+
+.fx-upload-icon {
+    color: #98a2b3;
+    font-size: 20px;
+    line-height: 1;
+    margin-bottom: 6px;
+}
+
+.fx-primary-button,
+.fx-secondary-button,
+.fx-link-button {
+    cursor: pointer;
+    font-family: var(--font-body);
+}
+
+.fx-primary-button {
+    align-items: center;
+    background: #2f5df5;
+    border: none;
+    border-radius: 4px;
+    color: #ffffff;
+    display: inline-flex;
+    font-size: 14px;
+    font-weight: 800;
+    gap: 10px;
+    height: 36px;
+    justify-content: center;
+    margin-top: 12px;
+    padding: 0 18px;
+    width: 100%;
+}
+
+.fx-primary-button:hover {
+    background: #1d4ed8;
+}
+
+.fx-button-icon {
+    font-size: 18px;
+    font-weight: 500;
+    line-height: 1;
+}
+
+.fx-approval-list {
+    display: flex;
+    flex-direction: column;
+}
+
+.fx-approval-row {
+    align-items: flex-start;
+    border-bottom: 1px solid #edf0f5;
+    display: flex;
+    gap: 20px;
+    justify-content: space-between;
+    min-height: 78px;
+    padding: 13px 20px;
+}
+
+.fx-approval-row:last-child {
+    border-bottom: none;
+}
+
+.fx-approval-copy {
+    min-width: 0;
+}
+
+.fx-approval-meta {
+    align-items: center;
+    display: flex;
+    font-size: 12px;
+    gap: 8px;
+    margin-bottom: 2px;
+}
+
+.fx-mono {
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+}
+
+.fx-muted,
+.fx-dot {
+    color: #8a95a7;
+}
+
+.fx-approval-client {
+    color: #1f2937;
+    font-size: 14px;
+    font-weight: 800;
+    line-height: 1.2;
+}
+
+.fx-approval-description {
+    color: #536174;
+    font-size: 12px;
+    line-height: 1.45;
+    margin-top: 2px;
+}
+
+.fx-approval-note {
+    color: #334155;
+    font-size: 12px;
+    font-style: italic;
+    line-height: 1.45;
+}
+
+.fx-approval-actions {
+    align-items: center;
+    display: flex;
+    gap: 10px;
+    padding-top: 2px;
+    white-space: nowrap;
+}
+
+.fx-link-button {
+    background: transparent;
+    border: none;
+    color: #1d4ed8;
+    font-size: 12px;
+    font-weight: 800;
+    padding: 0;
+}
+
+.fx-badge {
+    align-items: center;
+    border-radius: 4px;
+    display: inline-flex;
+    font-size: 12px;
+    font-weight: 800;
+    gap: 4px;
+    height: 18px;
+    line-height: 1;
+    padding: 0 8px;
+}
+
+.fx-badge-icon {
+    align-items: center;
+    border: 1px solid currentColor;
+    border-radius: 999px;
+    display: inline-flex;
+    font-size: 7px;
+    font-weight: 900;
+    height: 11px;
+    justify-content: center;
+    line-height: 1;
+    text-transform: uppercase;
+    width: 11px;
+}
+
+.fx-badge-pending {
+    background: #fff0bd;
+    color: #c45a00;
+}
+
+.fx-badge-approved,
+.fx-badge-complete,
+.fx-badge-ok {
+    background: #c8f7df;
+    color: #16845b;
+}
+
+.fx-badge-rejected {
+    background: #ffd8d8;
+    color: #c1121f;
+}
+
+.fx-execution-card {
+    padding: 22px 20px 20px;
+}
+
+.fx-section-divider {
+    align-items: center;
+    display: flex;
+    gap: 12px;
+    margin: 0 0 14px;
+}
+
+.fx-section-divider:not(:first-child) {
+    margin-top: 24px;
+}
+
+.fx-section-divider-label {
+    color: #98a2b3;
+    font-size: 10px;
+    font-weight: 900;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    white-space: nowrap;
+}
+
+.fx-section-divider-line {
+    background: #edf0f5;
+    flex: 1;
+    height: 1px;
+}
+
+.fx-client-grid {
+    display: grid;
+    gap: 16px;
+    grid-template-columns: minmax(160px, 1fr) minmax(240px, 2fr) minmax(160px, 1fr) minmax(160px, 1fr) minmax(160px, 1fr);
+}
+
+.fx-client-grid .fx-field + .fx-field,
+.fx-economics-grid .fx-field + .fx-field {
+    margin-top: 0;
+}
+
+.fx-economics-grid {
+    display: grid;
+    gap: 16px;
+    grid-template-columns: minmax(260px, 2.2fr) minmax(150px, 1fr) minmax(160px, 1fr) minmax(160px, 1fr) minmax(160px, 1fr);
+}
+
+.fx-segment {
+    height: 38px;
+    width: 100%;
+}
+
+.fx-segment .mantine-SegmentedControl-root,
+.fx-segment .mantine-SegmentedControl-control,
+.fx-segment .mantine-SegmentedControl-inner,
+.fx-segment .mantine-SegmentedControl-label {
+    height: 38px;
+}
+
+.fx-segment .mantine-SegmentedControl-label {
+    align-items: center;
+    color: #667085;
+    display: flex;
+    font-size: 12px;
+    font-weight: 800;
+    justify-content: center;
+}
+
+.fx-direction-segment .mantine-SegmentedControl-indicator {
+    background: #36996e;
+}
+
+.fx-direction-segment .mantine-SegmentedControl-label[data-active="true"] {
+    color: #ffffff;
+}
+
+.fx-notional-label {
+    margin-top: 18px;
+}
+
+.fx-notional-row {
+    align-items: center;
+    display: grid;
+    gap: 4px;
+    grid-template-columns: minmax(280px, 1fr) 48px minmax(280px, 1fr);
+    margin-top: 8px;
+}
+
+.fx-currency-input {
+    align-items: center;
+    background: #f8fafc;
+    border: 1px solid #cfd6e1;
+    border-radius: 3px;
+    display: flex;
+    height: 38px;
+    overflow: hidden;
+}
+
+.fx-currency-input-active {
+    background: #eff6ff;
+    border-color: #7bb3ff;
+}
+
+.fx-currency-code {
+    color: #1d4ed8;
+    font-size: 12px;
+    font-weight: 900;
+    min-width: 46px;
+    padding-left: 12px;
+}
+
+.fx-currency-divider {
+    background: #cfd6e1;
+    height: 18px;
+    width: 1px;
+}
+
+.fx-currency-field {
+    background: transparent;
+    border: none;
+    color: #111827;
+    flex: 1;
+    font-size: 14px;
+    height: 36px;
+    min-width: 0;
+    padding: 0 12px;
+}
+
+.fx-notional-arrow {
+    color: #98a2b3;
+    font-size: 18px;
+    font-weight: 900;
+    text-align: center;
+}
+
+.fx-foreign-row {
+    align-items: center;
+    display: flex;
+    gap: 8px;
+    margin: 8px 0 18px;
+}
+
+.fx-foreign-label {
+    color: #98a2b3;
+    font-size: 10px;
+    font-weight: 900;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+}
+
+.fx-mini-select {
+    width: 60px;
+}
+
+.fx-mini-select .Select-control {
+    min-height: 22px;
+}
+
+.fx-mini-select .Select-placeholder,
+.fx-mini-select .Select-value-label {
+    font-size: 12px;
+    line-height: 20px;
+}
+
+.fx-mini-select .Select-input {
+    height: 20px;
+}
+
+.fx-summary-box {
+    align-items: center;
+    background: #fbfcfe;
+    border: 1px dashed #dce3ee;
+    border-radius: 4px;
+    color: #8a95a7;
+    display: flex;
+    font-size: 12px;
+    height: 64px;
+    justify-content: center;
+}
+
+.fx-execution-actions {
+    border-top: 1px solid #edf0f5;
+    display: flex;
+    gap: 12px;
+    margin-top: 24px;
+    padding-top: 4px;
+}
+
+.fx-action-button {
+    margin-top: 0;
+    width: 134px;
+}
+
+.fx-secondary-button {
+    background: #ffffff;
+    border: 1px solid #cfd6e1;
+    border-radius: 4px;
+    color: #334155;
+    font-size: 14px;
+    font-weight: 700;
+    height: 39px;
+    padding: 0 18px;
+}
+
+.fx-settlement-card {
+    padding-top: 0;
+}
+
+.fx-table-wrap {
+    overflow-x: auto;
+}
+
+.fx-settlement-table {
+    border-collapse: collapse;
+    color: #273244;
+    font-size: 12px;
+    min-width: 1180px;
+    width: 100%;
+}
+
+.fx-settlement-table th {
+    background: #f7f8fb;
+    color: #98a2b3;
+    font-size: 10px;
+    font-weight: 900;
+    height: 34px;
+    letter-spacing: 0.12em;
+    padding: 0 16px;
+    text-align: left;
+    text-transform: uppercase;
+}
+
+.fx-settlement-table td {
+    border-top: 1px solid #edf0f5;
+    height: 49px;
+    padding: 0 16px;
+    white-space: nowrap;
+}
+
+.fx-settlement-row-complete td {
+    background: #f0fcf8;
+}
+
+.fx-align-right {
+    text-align: right;
+}
+
+@media (max-width: 1200px) {
+    .fx-approval-layout,
+    .fx-client-grid,
+    .fx-economics-grid {
+        grid-template-columns: repeat(2, minmax(220px, 1fr));
+    }
+
+    .fx-direction-field,
+    .fx-nature-field {
+        grid-column: auto;
+    }
+}
+
+@media (max-width: 800px) {
+    .fx-page-header {
+        margin-bottom: 18px;
+    }
+
+    .fx-stepper-card {
+        padding: 16px;
+    }
+
+    .fx-stepper .mantine-Stepper-step {
+        min-width: 0;
+    }
+
+    .fx-approval-layout,
+    .fx-client-grid,
+    .fx-economics-grid,
+    .fx-notional-row {
+        grid-template-columns: 1fr;
+    }
+
+    .fx-notional-arrow {
+        height: 18px;
+        line-height: 18px;
+    }
+
+    .fx-approval-row {
+        flex-direction: column;
+        gap: 8px;
+    }
+}

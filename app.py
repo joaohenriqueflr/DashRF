@@ -74,6 +74,12 @@ top_nav = html.Div(
                     className="nav-tab",
                 ),
                 dbc.NavLink(
+                    "FX Trading",
+                    href="/fx-trading",
+                    active="exact",
+                    className="nav-tab",
+                ),
+                dbc.NavLink(
                     "UGM Access",
                     href="/keys",
                     active="exact",
