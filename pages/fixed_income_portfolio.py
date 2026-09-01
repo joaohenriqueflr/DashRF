@@ -390,11 +390,11 @@ def _compound_yield(base_yield, spread_ref, index_name=None):
     if base_yield is None or pd.isna(base_yield):
         return None
     if spread_ref is None or pd.isna(spread_ref):
-        return float(base_yield)
+        return float(base_yield) * 100.0
     index_text = str(index_name or "").upper()
     if "%CDI" in index_text:
-        return float(base_yield) + float(spread_ref)
-    return (((1 + float(base_yield) / 100.0) * (1 + float(spread_ref) / 100.0)) - 1) * 100.0
+        return (float(base_yield) + float(spread_ref)) * 100.0
+    return (((1 + float(base_yield)) * (1 + float(spread_ref))) - 1) * 100.0
 
 
 def _axis_max(values, min_default, tick):
@@ -493,15 +493,26 @@ def build_portfolio_snapshot(tables):
     )
 
     market_df = market_df.dropna(subset=["DT_REF", "NM_SECURITY"]).copy()
-    market_df = market_df.loc[market_df["DT_REF"] <= latest_ref].copy()
 
     if not market_df.empty:
+        latest_market_ref = market_df["DT_REF"].max()
         latest_market = (
-            market_df.sort_values(["NM_SECURITY", "DT_REF"])
-            .groupby("NM_SECURITY", as_index=False)
-            .tail(1)[["NM_SECURITY", "VL_DURATION", "VL_BASE_YIELD", "VL_SPREAD_REF"]]
+            market_df.loc[market_df["DT_REF"] == latest_market_ref]
+            .drop_duplicates(["ID_SECURITY", "NM_SECURITY"], keep="last")[
+                [
+                    "ID_SECURITY",
+                    "NM_SECURITY",
+                    "VL_DURATION",
+                    "VL_BASE_YIELD",
+                    "VL_SPREAD_REF",
+                ]
+            ]
         )
-        merged = merged.merge(latest_market, on="NM_SECURITY", how="left")
+        merged = merged.merge(
+            latest_market,
+            on=["ID_SECURITY", "NM_SECURITY"],
+            how="left",
+        )
     else:
         merged["VL_DURATION"] = None
         merged["VL_BASE_YIELD"] = None
@@ -631,6 +642,7 @@ def build_exposure_chart_options(snapshot_df):
 
 def build_issuer_grid_data(snapshot_df):
     required_cols = {
+        "ID_SECURITY",
         "NM_ISSUER",
         "NM_SECTOR",
         "NM_SECURITY",
@@ -643,7 +655,32 @@ def build_issuer_grid_data(snapshot_df):
     if snapshot_df.empty or not required_cols.issubset(set(snapshot_df.columns)):
         return []
 
-    grid_df = snapshot_df.copy()
+    yield_source = (
+        "VL_COMPOUNDED_YIELD"
+        if "VL_COMPOUNDED_YIELD" in snapshot_df.columns
+        else "VL_BASE_YIELD"
+    )
+    if yield_source not in snapshot_df.columns:
+        return []
+
+    grid_df = (
+        snapshot_df.groupby(
+            ["ID_SECURITY", "NM_SECURITY"],
+            as_index=False,
+            dropna=False,
+        )
+        .agg(
+            NM_ISSUER=("NM_ISSUER", "first"),
+            NM_SECTOR=("NM_SECTOR", "first"),
+            NM_INSTRUMENT_TYPE=("NM_INSTRUMENT_TYPE", "first"),
+            NM_INDEX=("NM_INDEX", "first"),
+            NM_RATING=("NM_RATING", "first"),
+            VL_DURATION=("VL_DURATION", "first"),
+            VL_YIELD=(yield_source, "first"),
+            VL_EXPOSURE=("VL_EXPOSURE", "sum"),
+        )
+        .sort_values("VL_EXPOSURE", ascending=False)
+    )
     grid_df["issuer"] = grid_df["NM_ISSUER"].fillna("--")
     grid_df["sector"] = grid_df["NM_SECTOR"].fillna("-")
     grid_df["security_name"] = grid_df["NM_SECURITY"].fillna("--")
@@ -653,15 +690,9 @@ def build_issuer_grid_data(snapshot_df):
     grid_df["rating"] = (
         grid_df["NM_RATING"].replace(r"^\s*$", pd.NA, regex=True).fillna("Unrated")
     )
-    yield_source = (
-        "VL_COMPOUNDED_YIELD"
-        if "VL_COMPOUNDED_YIELD" in grid_df.columns
-        else "VL_BASE_YIELD"
-    )
-    grid_df["yield"] = grid_df[yield_source].apply(_format_pct)
+    grid_df["yield"] = grid_df["VL_YIELD"].apply(_format_pct)
     grid_df["duration"] = grid_df["VL_DURATION"].apply(_format_years)
     grid_df["exposure"] = grid_df["VL_EXPOSURE"].apply(_format_brl_string)
-    grid_df = grid_df.sort_values("VL_EXPOSURE", ascending=False)
 
     return grid_df[
         [
@@ -1708,6 +1739,28 @@ layout = dbc.Container(
                 ),
             ],
         ),
+        html.Div(
+            className="portfolio-account-filter-card",
+            children=[
+                html.Div(
+                    "Accounts",
+                    className="portfolio-account-filter-label",
+                ),
+                dcc.Dropdown(
+                    id="portfolio-account-filter",
+                    options=[],
+                    value=[],
+                    multi=True,
+                    clearable=True,
+                    placeholder="All accounts",
+                    className="portfolio-account-filter",
+                ),
+                html.Div(
+                    "Leave empty to consolidate all accounts.",
+                    className="portfolio-account-filter-help",
+                ),
+            ],
+        ),
         html.Div("Overview", className="portfolio-section-title"),
         html.Div(
             id="portfolio-stat-grid",
@@ -1979,6 +2032,7 @@ layout = dbc.Container(
 
 
 @callback(
+    Output("portfolio-account-filter", "options"),
     Output("portfolio-stat-grid", "children"),
     Output("portfolio-category-grid", "children"),
     Output("portfolio-issuer-grid", "rowData"),
@@ -1989,12 +2043,33 @@ layout = dbc.Container(
     Output("portfolio-forward-cashflow-section", "children"),
     Output("portfolio-highcharts-options-json", "children"),
     Input("portfolio-refresh-interval", "n_intervals"),
+    Input("portfolio-account-filter", "value"),
 )
-def refresh_portfolio_page(_):
+def refresh_portfolio_page(_, selected_accounts):
     tables = load_portfolio_tables()
     snapshot_df, total_exposure, positions_count, clients_count = (
         build_portfolio_snapshot(tables)
     )
+
+    available_accounts = sorted(
+        snapshot_df["ID_CLIENT"].dropna().astype(int).unique().tolist()
+    )
+    account_options = [
+        {"label": f"Account {account_id}", "value": account_id}
+        for account_id in available_accounts
+    ]
+
+    if selected_accounts:
+        selected_account_ids = pd.to_numeric(
+            pd.Series(selected_accounts),
+            errors="coerce",
+        ).dropna()
+        snapshot_df = snapshot_df.loc[
+            snapshot_df["ID_CLIENT"].isin(selected_account_ids)
+        ].copy()
+        total_exposure = float(snapshot_df["VL_EXPOSURE"].sum())
+        positions_count = int(snapshot_df["ID_SECURITY"].nunique())
+        clients_count = int(snapshot_df["ID_CLIENT"].nunique())
 
     stat_children = [
         stat_card("Total Exposure", _format_brl_string(total_exposure), "↗", "accent-blue"),
@@ -2066,6 +2141,7 @@ def refresh_portfolio_page(_):
     }
 
     return (
+        account_options,
         stat_children,
         category_children,
         grid_rows,

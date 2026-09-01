@@ -20,6 +20,52 @@
     color: #64748b;
 }
 
+.portfolio-account-filter-card {
+    display: grid;
+    grid-template-columns: minmax(260px, 460px) 1fr;
+    align-items: end;
+    column-gap: 16px;
+    row-gap: 4px;
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    padding: 14px 16px;
+    margin-bottom: 18px;
+}
+
+.portfolio-account-filter-label {
+    grid-column: 1;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: #475569;
+}
+
+.portfolio-account-filter {
+    grid-column: 1;
+    width: 100%;
+}
+
+.portfolio-account-filter-help {
+    grid-column: 2;
+    grid-row: 2;
+    align-self: center;
+    font-size: 12px;
+    color: #64748b;
+}
+
+@media (max-width: 720px) {
+    .portfolio-account-filter-card {
+        grid-template-columns: 1fr;
+    }
+
+    .portfolio-account-filter-help {
+        grid-column: 1;
+        grid-row: auto;
+    }
+}
+
 .portfolio-section-title {
     font-size: 16px;
     font-weight: 600;

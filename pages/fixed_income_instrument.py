@@ -281,8 +281,9 @@ def load_market_data_df(selected_security=None):
         "VL_TRADED",
     ]:
         df[numeric_col] = pd.to_numeric(df[numeric_col], errors="coerce")
-    df["VL_SPREAD_BID"] = df["VL_SPREAD_BID"] * 100.0
-    df["VL_SPREAD_ASK"] = df["VL_SPREAD_ASK"] * 100.0
+    df["VL_SPREAD_BID"] = df["VL_SPREAD_BID"] * 10_000.0
+    df["VL_SPREAD_ASK"] = df["VL_SPREAD_ASK"] * 10_000.0
+    df["VL_BASE_YIELD"] = df["VL_BASE_YIELD"] * 100.0
     df["NM_SECURITY"] = df["NM_SECURITY"].fillna("").astype(str).str.strip()
     return df
 
