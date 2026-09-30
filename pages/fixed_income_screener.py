@@ -3,6 +3,7 @@ from pathlib import Path
 
 import dash_ag_grid as dag
 import dash_bootstrap_components as dbc
+import dash_mantine_components as dmc
 import pandas as pd
 import plotly.graph_objects as go
 from dash import Input, Output, State, callback, dcc, html, register_page
@@ -13,6 +14,14 @@ register_page(__name__, path="/FI-Screener", name="Fixed Income Screener")
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATABASE_PATH = BASE_DIR / "data" / "fixed_income.db"
+
+INDEX_CATEGORIES = ("Inflation", "Fixed Rate", "Floating Rate")
+MINIMUM_MTD_VOLUME_BY_STEP = {
+    0: 0,
+    1: 500_000,
+    2: 1_000_000,
+    3: 10_000_000,
+}
 
 SCREENER_COLUMNS = [
     {
@@ -195,6 +204,7 @@ def _empty_snapshot():
             "rating",
             "ticker",
             "index",
+            "index_category",
             "asset_count",
             "duration",
             "maturity_date",
@@ -336,6 +346,17 @@ def _representative_label(values, fallback="--"):
     return str(counts.index[0])
 
 
+def _index_category(index_name):
+    normalized = str(index_name or "").strip().upper().replace("-", "")
+    if any(token in normalized for token in ("IPCA", "IGPM", "INFLATION")):
+        return "Inflation"
+    if any(token in normalized for token in ("PRE", "FIXED")):
+        return "Fixed Rate"
+    if any(token in normalized for token in ("CDI", "SELIC", "FLOAT")):
+        return "Floating Rate"
+    return "--"
+
+
 def _format_maturity_dates(values):
     maturity_dates = pd.to_datetime(pd.Series(values), errors="coerce").dropna()
     if maturity_dates.empty:
@@ -420,6 +441,7 @@ def build_issuer_snapshot():
             if code
         )
         last_trade = last_trade_dates.get(issuer)
+        index_name = _representative_label(issuer_df["NM_INDEX"])
 
         rows.append(
             {
@@ -428,7 +450,8 @@ def build_issuer_snapshot():
                 "rating": _representative_label(
                     issuer_df["NM_RATING"], fallback="Unrated"
                 ),
-                "index": _representative_label(issuer_df["NM_INDEX"]),
+                "index": index_name,
+                "index_category": _index_category(index_name),
                 "asset_count": len(codes),
                 "ticker": ", ".join(codes),
                 "duration": duration,
@@ -482,8 +505,7 @@ def _filter_snapshot(
     snapshot_df,
     search_text=None,
     sectors=None,
-    ratings=None,
-    indices=None,
+    index_category_value="Inflation",
     minimum_mtd=0,
 ):
     if snapshot_df.empty:
@@ -501,11 +523,13 @@ def _filter_snapshot(
         filtered_df = filtered_df.loc[haystack.str.contains(needle, regex=False)]
     if sectors:
         filtered_df = filtered_df.loc[filtered_df["sector"].isin(sectors)]
-    if ratings:
-        filtered_df = filtered_df.loc[filtered_df["rating"].isin(ratings)]
-    if indices:
-        filtered_df = filtered_df.loc[filtered_df["index"].isin(indices)]
-    minimum_mtd = float(minimum_mtd or 0)
+    selected_category = str(index_category_value or "Inflation")
+    if selected_category not in INDEX_CATEGORIES:
+        selected_category = "Inflation"
+    filtered_df = filtered_df.loc[
+        filtered_df["index_category"].eq(selected_category)
+    ]
+    minimum_mtd = MINIMUM_MTD_VOLUME_BY_STEP.get(int(minimum_mtd or 0), 0)
     filtered_df = filtered_df.loc[filtered_df["volume_mtd"].ge(minimum_mtd)]
     return filtered_df.reset_index(drop=True)
 
@@ -633,15 +657,11 @@ def _options(values):
 def _filter_options():
     snapshot_df, _ = build_issuer_snapshot()
     if snapshot_df.empty:
-        return [], [], []
-    return (
-        _options(snapshot_df["sector"]),
-        _options(snapshot_df["rating"]),
-        _options(snapshot_df["index"]),
-    )
+        return []
+    return _options(snapshot_df["sector"])
 
 
-SECTOR_OPTIONS, RATING_OPTIONS, INDEX_OPTIONS = _filter_options()
+SECTOR_OPTIONS = _filter_options()
 
 layout = dbc.Container(
     fluid=True,
@@ -697,13 +717,14 @@ layout = dbc.Container(
                     className="screener-filter screener-search-filter",
                     children=[
                         html.Label("Search", htmlFor="screener-search"),
-                        dcc.Input(
+                        dmc.TextInput(
                             id="screener-search",
                             value="",
-                            type="search",
                             debounce=True,
                             placeholder="Issuer, security, or sector",
-                            className="screener-search-input",
+                            h=38,
+                            radius="md",
+                            className="screener-mantine-input",
                         ),
                     ],
                 ),
@@ -711,68 +732,75 @@ layout = dbc.Container(
                     className="screener-filter",
                     children=[
                         html.Label("Sector"),
-                        dcc.Dropdown(
+                        dmc.MultiSelect(
                             id="screener-sector",
-                            options=SECTOR_OPTIONS,
+                            data=SECTOR_OPTIONS,
                             value=[],
-                            multi=True,
                             placeholder="All sectors",
-                            className="screener-dropdown",
+                            searchable=True,
+                            clearable=True,
+                            h=38,
+                            radius="md",
+                            className="screener-mantine-input",
                         ),
                     ],
                 ),
                 html.Div(
-                    className="screener-filter",
-                    children=[
-                        html.Label("Rating"),
-                        dcc.Dropdown(
-                            id="screener-rating",
-                            options=RATING_OPTIONS,
-                            value=[],
-                            multi=True,
-                            placeholder="All ratings",
-                            className="screener-dropdown",
-                        ),
-                    ],
-                ),
-                html.Div(
-                    className="screener-filter",
+                    className="screener-filter screener-index-control-filter",
                     children=[
                         html.Label("Index"),
-                        dcc.Dropdown(
-                            id="screener-index",
-                            options=INDEX_OPTIONS,
-                            value=[],
-                            multi=True,
-                            placeholder="All indices",
-                            className="screener-dropdown",
+                        dmc.SegmentedControl(
+                            id="screener-index-category",
+                            data=list(INDEX_CATEGORIES),
+                            value="Inflation",
+                            fullWidth=True,
+                            color="gray",
+                            size="sm",
+                            radius="md",
+                            h=38,
+                            transitionDuration=150,
+                            withItemsBorders=False,
+                            className="screener-index-segmented",
                         ),
                     ],
                 ),
                 html.Div(
-                    className="screener-filter",
+                    className="screener-filter screener-volume-slider-filter",
                     children=[
                         html.Label("Minimum MTD volume"),
-                        dcc.Dropdown(
-                            id="screener-min-volume",
-                            options=[
-                                {"label": "Any volume", "value": 0},
-                                {"label": "R$ 10M+", "value": 10_000_000},
-                                {"label": "R$ 50M+", "value": 50_000_000},
-                                {"label": "R$ 100M+", "value": 100_000_000},
-                                {"label": "R$ 250M+", "value": 250_000_000},
-                            ],
-                            value=0,
-                            clearable=False,
-                            className="screener-dropdown",
+                        html.Div(
+                            className="screener-volume-slider-shell",
+                            children=dmc.Slider(
+                                id="screener-min-volume",
+                                min=0,
+                                max=3,
+                                step=1,
+                                value=0,
+                                marks=[
+                                    {"value": 0, "label": "0"},
+                                    {"value": 1, "label": "500K"},
+                                    {"value": 2, "label": "1MM"},
+                                    {"value": 3, "label": "10MM"},
+                                ],
+                                restrictToMarks=True,
+                                label=None,
+                                updatemode="mouseup",
+                                color="blue",
+                                size="sm",
+                                thumbSize=16,
+                                className="screener-volume-slider",
+                            ),
                         ),
                     ],
                 ),
-                html.Button(
+                dmc.Button(
                     "Clear filters",
                     id="screener-reset",
+                    variant="subtle",
+                    color="gray",
+                    radius="md",
+                    h=38,
                     className="screener-reset-button",
-                    type="button",
                 ),
             ],
         ),
@@ -888,9 +916,7 @@ layout = dbc.Container(
 
 
 @callback(
-    Output("screener-sector", "options"),
-    Output("screener-rating", "options"),
-    Output("screener-index", "options"),
+    Output("screener-sector", "data"),
     Input("screener-initial-load", "n_intervals"),
     Input("screener-refresh", "n_clicks"),
 )
@@ -908,8 +934,7 @@ def refresh_screener_filter_options(_initial_load, _refresh_clicks):
     Input("screener-refresh", "n_clicks"),
     Input("screener-search", "value"),
     Input("screener-sector", "value"),
-    Input("screener-rating", "value"),
-    Input("screener-index", "value"),
+    Input("screener-index-category", "value"),
     Input("screener-min-volume", "value"),
 )
 def refresh_screener(
@@ -917,8 +942,7 @@ def refresh_screener(
     _refresh_clicks,
     search_text,
     sectors,
-    ratings,
-    indices,
+    index_category_value,
     minimum_mtd,
 ):
     snapshot_df, reference_date = build_issuer_snapshot()
@@ -926,8 +950,7 @@ def refresh_screener(
         snapshot_df,
         search_text,
         sectors,
-        ratings,
-        indices,
+        index_category_value,
         minimum_mtd,
     )
 
@@ -953,14 +976,13 @@ def refresh_screener(
 @callback(
     Output("screener-search", "value"),
     Output("screener-sector", "value"),
-    Output("screener-rating", "value"),
-    Output("screener-index", "value"),
+    Output("screener-index-category", "value"),
     Output("screener-min-volume", "value"),
     Input("screener-reset", "n_clicks"),
     prevent_initial_call=True,
 )
 def reset_screener_filters(_clicks):
-    return "", [], [], [], 0
+    return "", [], "Inflation", 0
 
 
 @callback(
@@ -968,8 +990,7 @@ def reset_screener_filters(_clicks):
     Input("screener-export", "n_clicks"),
     State("screener-search", "value"),
     State("screener-sector", "value"),
-    State("screener-rating", "value"),
-    State("screener-index", "value"),
+    State("screener-index-category", "value"),
     State("screener-min-volume", "value"),
     prevent_initial_call=True,
 )
@@ -977,8 +998,7 @@ def export_screener_csv(
     clicks,
     search_text,
     sectors,
-    ratings,
-    indices,
+    index_category_value,
     minimum_mtd,
 ):
     if not clicks:
@@ -988,8 +1008,7 @@ def export_screener_csv(
         snapshot_df,
         search_text,
         sectors,
-        ratings,
-        indices,
+        index_category_value,
         minimum_mtd,
     ).rename(
         columns={
