@@ -710,7 +710,16 @@ def build_issuer_grid_data(snapshot_df):
     ].to_dict("records")
 
 
-def _build_duration_chart_options(points, x_max, y_max, x_tick, y_tick):
+def _build_duration_chart_options(
+    points,
+    x_max,
+    y_max,
+    x_tick,
+    y_tick,
+    exposure_scale_max,
+):
+    exposure_scale_max = float(exposure_scale_max)
+    z_max = exposure_scale_max if exposure_scale_max > 0 else 1.0
     series_data = []
     for point in points:
         series_data.append(
@@ -790,8 +799,12 @@ def _build_duration_chart_options(points, x_max, y_max, x_tick, y_tick):
         },
         "plotOptions": {
             "bubble": {
-                "minSize": 18,
+                "minSize": 0,
                 "maxSize": 70,
+                "zMin": 0,
+                "zMax": z_max,
+                "sizeBy": "area",
+                "displayNegative": False,
                 "stickyTracking": True,
                 "marker": {"lineColor": "rgba(15,23,42,0.12)", "lineWidth": 0.5},
                 "states": {"hover": {"enabled": True, "halo": {"size": 6}}},
@@ -825,17 +838,43 @@ def build_duration_chart_options(snapshot_df):
                 y_max=cfg["y_max"],
                 x_tick=cfg["x_tick"],
                 y_tick=cfg["y_tick"],
+                exposure_scale_max=1.0,
             )
             for bucket, cfg in defaults.items()
         }
 
+    duration_df = snapshot_df.dropna(
+        subset=[
+            "VL_DURATION",
+            "VL_COMPOUNDED_YIELD",
+            "VL_EXPOSURE",
+        ]
+    ).copy()
+    duration_df = (
+        duration_df.groupby(
+            ["bucket", "NM_SECURITY", "NM_INDEX", "NM_RATING"],
+            as_index=False,
+            dropna=False,
+        )
+        .agg(
+            VL_DURATION=("VL_DURATION", "first"),
+            VL_COMPOUNDED_YIELD=("VL_COMPOUNDED_YIELD", "first"),
+            VL_EXPOSURE=("VL_EXPOSURE", "sum"),
+        )
+    )
+    duration_df = duration_df.loc[
+        (duration_df["VL_EXPOSURE"] >= 0)
+        & (duration_df["VL_COMPOUNDED_YIELD"] >= 0)
+    ].copy()
+    exposure_scale_max = (
+        float(duration_df["VL_EXPOSURE"].max()) / 1_000_000
+        if not duration_df.empty
+        else 1.0
+    )
+
     options = {}
     for bucket, cfg in defaults.items():
-        bucket_df = snapshot_df.loc[snapshot_df["bucket"] == bucket].copy()
-        bucket_df = bucket_df.dropna(
-            subset=["VL_DURATION", "VL_COMPOUNDED_YIELD", "VL_EXPOSURE"]
-        )
-        bucket_df = bucket_df.loc[bucket_df["VL_EXPOSURE"] > 0]
+        bucket_df = duration_df.loc[duration_df["bucket"] == bucket].copy()
 
         if bucket_df.empty:
             options[bucket] = _build_duration_chart_options(
@@ -844,22 +883,9 @@ def build_duration_chart_options(snapshot_df):
                 y_max=cfg["y_max"],
                 x_tick=cfg["x_tick"],
                 y_tick=cfg["y_tick"],
+                exposure_scale_max=exposure_scale_max,
             )
             continue
-
-        # Portfolio positions are stored at client level; chart bubbles should
-        # represent one point per security with exposure summed across clients.
-        bucket_df = (
-            bucket_df.groupby(
-                ["NM_SECURITY", "NM_INDEX", "NM_RATING"],
-                as_index=False,
-            )
-            .agg(
-                VL_DURATION=("VL_DURATION", "first"),
-                VL_COMPOUNDED_YIELD=("VL_COMPOUNDED_YIELD", "first"),
-                VL_EXPOSURE=("VL_EXPOSURE", "sum"),
-            )
-        )
 
         chart_df = pd.DataFrame(
             {
@@ -873,7 +899,7 @@ def build_duration_chart_options(snapshot_df):
                 "exposure_raw": bucket_df["VL_EXPOSURE"],
             }
         ).dropna(subset=["x", "y", "exposure_raw"])
-        chart_df = chart_df.loc[chart_df["exposure_raw"] > 0]
+        chart_df = chart_df.loc[chart_df["exposure_raw"] >= 0]
         chart_df = chart_df.loc[chart_df["y"] >= 0]
 
         if chart_df.empty:
@@ -883,6 +909,7 @@ def build_duration_chart_options(snapshot_df):
                 y_max=cfg["y_max"],
                 x_tick=cfg["x_tick"],
                 y_tick=cfg["y_tick"],
+                exposure_scale_max=exposure_scale_max,
             )
             continue
 
@@ -895,6 +922,7 @@ def build_duration_chart_options(snapshot_df):
             y_max=_axis_max(chart_df["y"], cfg["y_max"], cfg["y_tick"]),
             x_tick=cfg["x_tick"],
             y_tick=cfg["y_tick"],
+            exposure_scale_max=exposure_scale_max,
         )
 
     return options

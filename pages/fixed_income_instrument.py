@@ -281,9 +281,6 @@ def load_market_data_df(selected_security=None):
         "VL_TRADED",
     ]:
         df[numeric_col] = pd.to_numeric(df[numeric_col], errors="coerce")
-    df["VL_SPREAD_BID"] = df["VL_SPREAD_BID"] * 10_000.0
-    df["VL_SPREAD_ASK"] = df["VL_SPREAD_ASK"] * 10_000.0
-    df["VL_BASE_YIELD"] = df["VL_BASE_YIELD"] * 100.0
     df["NM_SECURITY"] = df["NM_SECURITY"].fillna("").astype(str).str.strip()
     return df
 
@@ -313,6 +310,7 @@ def load_broker_data_df(selected_security=None):
     df["DT_INPUT"] = pd.to_datetime(df["DT_INPUT"], errors="coerce")
     for numeric_col in ["TX_QUOTE", "VL_QUOTE"]:
         df[numeric_col] = pd.to_numeric(df[numeric_col], errors="coerce")
+    df["TX_QUOTE"] = df["TX_QUOTE"] * 100.0
     for column_name in ["NM_SECURITY", "NM_SOURCE", "NM_BROKER", "SIDE", "USR_INPUT"]:
         if column_name in df.columns:
             df[column_name] = df[column_name].fillna("").astype(str).str.strip()
@@ -405,6 +403,11 @@ def load_kpi_metrics(selected_security, time_range):
         spread_ask = _to_float(latest_row.get("VL_SPREAD_ASK"))
         reference_rate = _to_float(latest_row.get("VL_BASE_YIELD"))
         duration = _to_float(latest_row.get("VL_DURATION"))
+        spread_bid = spread_bid * 10_000.0 if spread_bid is not None else None
+        spread_ask = spread_ask * 10_000.0 if spread_ask is not None else None
+        reference_rate = (
+            reference_rate * 100.0 if reference_rate is not None else None
+        )
 
     avg_volume = None
     if len(business_days) > 0:
@@ -802,6 +805,7 @@ def build_spread_volume_options(selected_security, time_range):
                 "NM_SECURITY",
                 "VL_SPREAD_BID",
                 "VL_SPREAD_ASK",
+                "VL_BASE_YIELD",
                 "VL_TRADED",
             ]
         ].copy()
@@ -830,23 +834,36 @@ def build_spread_volume_options(selected_security, time_range):
         trade_df["VL_SPREAD_ASK"] = pd.to_numeric(
             trade_df["VL_SPREAD_ASK"], errors="coerce"
         )
+        trade_df["VL_BASE_YIELD"] = pd.to_numeric(
+            trade_df["VL_BASE_YIELD"], errors="coerce"
+        )
         trade_df["VL_TRADED"] = pd.to_numeric(trade_df["VL_TRADED"], errors="coerce")
         trade_df = trade_df.dropna(subset=["DT_REF"])
+        trade_df["TX_BID"] = (
+            (1.0 + trade_df["VL_BASE_YIELD"])
+            * (1.0 + trade_df["VL_SPREAD_BID"])
+            - 1.0
+        ) * 100.0
+        trade_df["TX_ASK"] = (
+            (1.0 + trade_df["VL_BASE_YIELD"])
+            * (1.0 + trade_df["VL_SPREAD_ASK"])
+            - 1.0
+        ) * 100.0
 
         plot_df = (
             trade_df.groupby("DT_REF", as_index=True)
             .agg(
                 {
                     "VL_TRADED": "sum",
-                    "VL_SPREAD_BID": "mean",
-                    "VL_SPREAD_ASK": "mean",
+                    "TX_BID": "mean",
+                    "TX_ASK": "mean",
                 }
             )
             .rename(
                 columns={
                     "VL_TRADED": "VL_QUOTE",
-                    "VL_SPREAD_BID": "Bid",
-                    "VL_SPREAD_ASK": "Ask",
+                    "TX_BID": "Bid",
+                    "TX_ASK": "Ask",
                 }
             )
             .sort_index()
