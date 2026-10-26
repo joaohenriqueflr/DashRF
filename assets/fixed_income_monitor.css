@@ -33,6 +33,17 @@
     letter-spacing: 0.6px;
 }
 
+.monitor-time-range {
+    min-height: 44px;
+}
+
+.monitor-time-range .mantine-SegmentedControl-label {
+    padding: 8px 6px;
+    font-family: var(--font-body);
+    font-size: 12px;
+    font-weight: 600;
+}
+
 .desk-card {
     background: #f8fbff;
     border: 1px solid #dbe6fb;

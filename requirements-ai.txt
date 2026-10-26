@@ -1,0 +1,2 @@
+# Additional dependency for AI assistance. Install into the environment running app.py.
+openai>=2.0.0,<4

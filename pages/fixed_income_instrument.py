@@ -19,6 +19,7 @@ from dash import (
 from dash.exceptions import PreventUpdate
 import dash_bootstrap_components as dbc
 import dash_ag_grid as dag
+import dash_mantine_components as dmc
 
 import numpy as np
 import pandas as pd
@@ -58,10 +59,10 @@ column_defs = [
 ]
 
 TIME_RANGE_OPTIONS = [
-    {"label": "Last 7 Days", "value": "7d"},
-    {"label": "Last 30 Days", "value": "30d"},
-    {"label": "Last 90 Days", "value": "90d"},
-    {"label": "Year to Date", "value": "ytd"},
+    {"label": "7D", "value": "7d"},
+    {"label": "30D", "value": "30d"},
+    {"label": "90D", "value": "90d"},
+    {"label": "YTD", "value": "ytd"},
 ]
 
 
@@ -614,12 +615,15 @@ layout = dbc.Container(
                             className="control-card",
                             children=[
                                 html.Div("Time Range", className="control-label"),
-                                dcc.Dropdown(
-                                    id="time-range-dropdown",
-                                    options=TIME_RANGE_OPTIONS,
+                                dmc.SegmentedControl(
+                                    id="time-range-control",
+                                    data=TIME_RANGE_OPTIONS,
                                     value="30d",
-                                    clearable=False,
-                                    className="dropdown-input time-input",
+                                    fullWidth=True,
+                                    color="blue",
+                                    size="sm",
+                                    radius="md",
+                                    className="monitor-time-range",
                                 ),
                             ],
                         ),
@@ -783,7 +787,7 @@ def refresh_instrument_dropdown(_):
     Output("kpi-duration-value", "children"),
     Output("kpi-avg-volume-value", "children"),
     Input("instrument-dropdown", "value"),
-    Input("time-range-dropdown", "value"),
+    Input("time-range-control", "value"),
 )
 def update_kpi_cards(selected_security, time_range):
     metrics = load_kpi_metrics(selected_security, time_range)
@@ -1114,7 +1118,7 @@ def build_spread_volume_options(selected_security, time_range):
 @callback(
     Output("spread-volume-options-json", "children"),
     Input("instrument-dropdown", "value"),
-    Input("time-range-dropdown", "value"),
+    Input("time-range-control", "value"),
 )
 def update_chart_options_json(selected_security, time_range):
     options = build_spread_volume_options(selected_security, time_range)
@@ -1131,7 +1135,7 @@ clientside_callback(
 @callback(
     Output("trade-grid", "rowData"),
     Input("instrument-dropdown", "value"),
-    Input("time-range-dropdown", "value"),
+    Input("time-range-control", "value"),
 )
 def update_trade_grid(selected_security, time_range):
     trades_df = load_grid_trades_df(selected_security, time_range)
