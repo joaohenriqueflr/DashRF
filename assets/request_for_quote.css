@@ -391,6 +391,102 @@
     margin-bottom: 16px;
 }
 
+.rfq-trade-block + .rfq-trade-block {
+    border-top: 1px solid #dbe3ed;
+    margin-top: 18px;
+    padding-top: 18px;
+}
+
+.rfq-trade-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    color: #334155;
+    font-size: 13px;
+    margin-bottom: 10px;
+}
+
+.rfq-add-trade,
+.rfq-remove-trade {
+    appearance: none;
+    box-sizing: border-box;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    width: 34px;
+    height: 34px;
+    padding: 0;
+    border: 1px solid #e9edf3;
+    border-radius: 50%;
+    background: #f8fafc;
+    color: #8190a5;
+    font-family: inherit;
+    font-size: 22px;
+    font-weight: 500;
+    line-height: 1;
+    cursor: pointer;
+    box-shadow: none;
+    transition: background-color 0.15s ease, border-color 0.15s ease,
+                color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.rfq-add-trade > span,
+.rfq-remove-trade > span {
+    display: block;
+    position: relative;
+    width: 14px;
+    height: 14px;
+    font-size: 0;
+    pointer-events: none;
+}
+
+.rfq-add-trade > span::before,
+.rfq-add-trade > span::after,
+.rfq-remove-trade > span::before {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 12px;
+    height: 1.5px;
+    border-radius: 2px;
+    background: currentColor;
+    transform: translate(-50%, -50%);
+}
+
+.rfq-add-trade > span::after {
+    transform: translate(-50%, -50%) rotate(90deg);
+}
+
+.rfq-add-trade:not(:disabled):hover {
+    background: #eef4ff;
+    border-color: #dce7fa;
+    color: #5276b5;
+    box-shadow: 0 2px 6px rgb(52 82 130 / 6%);
+}
+
+.rfq-remove-trade:not(:disabled):hover {
+    background: #fff3f4;
+    border-color: #f8dfe3;
+    color: #c56a78;
+    box-shadow: 0 2px 6px rgb(130 52 68 / 5%);
+}
+
+.rfq-add-trade:focus-visible,
+.rfq-remove-trade:focus-visible {
+    outline: 2px solid #a5b9de;
+    outline-offset: 3px;
+}
+
+.rfq-add-trade:disabled,
+.rfq-remove-trade:disabled,
+.rfq-fields-shell:disabled .rfq-remove-trade,
+.rfq-fields-shell:disabled .rfq-add-trade {
+    opacity: 0.55;
+    cursor: wait;
+}
+
 .rfq-fieldset {
     border: 1px solid #e2e8f0;
     border-radius: 10px;

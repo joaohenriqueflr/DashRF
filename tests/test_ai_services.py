@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 
 from services.openai_client import AIConfigurationError, AIError, OpenAIService
 from services.prompts import PromptStore
-from services.ai_audit import AIRequestLog, FormEventLog
+from services.ai_audit import AIRequestLog
 
 
 class AIServiceTests(unittest.TestCase):
@@ -134,21 +134,28 @@ class AIServiceTests(unittest.TestCase):
             with self.assertRaises(AIConfigurationError):
                 OpenAIService()._get_client()
 
-    def test_form_event_preserves_existing_model_failure_and_usage(self):
+    def test_validation_status_preserves_existing_model_failure_and_usage(self):
         audit = AIRequestLog(self.db)
-        events = FormEventLog(self.db)
         audit.ensure_schema()
-        events.ensure_schema()
         log_id = audit.begin(feature="screening", form_type="test", username="Test User", text="Request",
                              prompt=self.store.get_active("screening", "extract"))
         error = AIError("Original provider error", error_type="ProviderError",
                         input_tokens=12, output_tokens=6, total_tokens=18)
         audit.finish(log_id, status="failed", error=error)
-        events.record(feature="screening", form_type="test", username="Test User", level="error",
-                      source="test_form", message="User-facing failure", ai_log_id=log_id)
+        audit.mark_invalid(log_id, error_type="ValidationError", message="User-facing failure")
         with closing(sqlite3.connect(self.db)) as conn:
             row = conn.execute("SELECT STATUS, ERROR_TYPE, ERROR_MESSAGE, INPUT_TOKENS, OUTPUT_TOKENS, TOTAL_TOKENS FROM AI_REQUEST_LOG WHERE LOG_ID=?", (log_id,)).fetchone()
         self.assertEqual(row, ("failed", "ProviderError", "Original provider error", 12, 6, 18))
+
+    def test_audit_initialization_only_creates_ai_request_history(self):
+        audit = AIRequestLog(self.db)
+        audit.ensure_schema()
+        audit.ensure_schema()
+        with closing(sqlite3.connect(self.db)) as conn:
+            tables = {row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            )}
+        self.assertEqual(tables, {"AI_PROMPTS", "AI_REQUEST_LOG"})
 
     def test_audit_migration_keeps_records_and_only_one_output_column(self):
         audit = AIRequestLog(self.db)

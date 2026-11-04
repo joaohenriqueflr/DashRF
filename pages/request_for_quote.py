@@ -11,6 +11,8 @@ from datetime import date, datetime
 from pathlib import Path
 
 from dash import (
+    ALL,
+    MATCH,
     ClientsideFunction,
     Input,
     Output,
@@ -29,7 +31,7 @@ import dash_bootstrap_components as dbc
 import dash_mantine_components as dmc
 
 from services.openai_client import AIConfigurationError, AIError, OpenAIService, build_structured_request
-from services.ai_audit import AIRequestLog, FormEventLog
+from services.ai_audit import AIRequestLog
 from services.prompts import PromptStore
 
 register_page(__name__, path="/rfq", name="UGM Request for Quote")
@@ -39,6 +41,7 @@ DATABASE_PATH = BASE_DIR / "data" / "fixed_income.db"
 logger = logging.getLogger(__name__)
 RFQ_AI_MAX_CHARS = 200
 FIXED_INCOME_QUOTE_TYPE = "Mkt Color"
+MULTI_TRADE_ASSETS = ("sovereign", "corporate")
 
 
 RFQ_FIELDS = {
@@ -518,7 +521,6 @@ def ensure_rfq_schema():
 ensure_rfq_schema()
 PromptStore(DATABASE_PATH).ensure_schema()
 AIRequestLog(DATABASE_PATH).ensure_schema()
-FormEventLog(DATABASE_PATH).ensure_schema()
 
 
 
@@ -812,10 +814,13 @@ def rfq_components():
                 visit(child)
         elif hasattr(component, "to_plotly_json"):
             if getattr(component, "id", None):
-                found[component.id] = component
+                if isinstance(component.id, str):
+                    found[component.id] = component
             visit(getattr(component, "children", None))
 
     visit(layout)
+    visit(sovereign_trade_block())
+    visit(corporate_trade_block())
     return found
 
 
@@ -830,7 +835,7 @@ def rfq_empty_form(asset_class, username):
     return values
 
 
-def rfq_json_contract(asset_class, username, *, sovereign_assets=None):
+def rfq_json_contract(asset_class, username, *, sovereign_assets=None, corporate_options=None):
     """Build one JSON contract per form from its controls and existing loaders."""
     components = rfq_components()
     defaults = rfq_empty_form(asset_class, username)
@@ -848,7 +853,7 @@ def rfq_json_contract(asset_class, username, *, sovereign_assets=None):
         options["bond_name"], maturity_by_bond = sovereign_form_options(assets)
         options["maturity"] = [option for group in maturity_by_bond.values() for option in group]
     elif asset_class == "corporate":
-        options["security"] = load_corporate_security_options()
+        options["security"] = load_corporate_security_options() if corporate_options is None else corporate_options
 
     properties = {}
     definitions = {}
@@ -867,7 +872,8 @@ def rfq_json_contract(asset_class, username, *, sovereign_assets=None):
             spec = {"type": "string", "enum": [username]}
         properties[name] = spec
         definitions[name] = {
-            "component_id": component_id, "type": kind, "default": defaults[name],
+            "component_id": rfq_trade_field_id(asset_class, name, "<trade_id>") if asset_class in MULTI_TRADE_ASSETS else component_id,
+            "type": kind, "default": defaults[name],
             "required": name == "requester" or name in RFQ_RULES[asset_class]["required"],
             "optional": name != "requester" and name not in RFQ_RULES[asset_class]["required"],
             "options": options.get(name), "read_only": name == "requester",
@@ -885,10 +891,26 @@ def rfq_json_contract(asset_class, username, *, sovereign_assets=None):
             "unresolved_fields": {"type": "array", "items": {"type": "string", "enum": list(properties)}},
         },
     }
+    if asset_class in MULTI_TRADE_ASSETS:
+        trade_schema = {
+            "type": "object", "additionalProperties": False,
+            "required": ["fields", "unresolved_fields"],
+            "properties": {name: schema["properties"].pop(name)
+                           for name in ("fields", "unresolved_fields")},
+        }
+        schema["required"] = ["asset_class", "is_rfq_request", "request_count", "has_conflicts", "trades"]
+        schema["properties"]["trades"] = {"type": "array", "items": trade_schema}
     return {"asset_class": asset_class, "output_schema": schema,
             "field_definitions": definitions, "validation_rules": RFQ_RULES[asset_class],
             "fixed_values": {"quote_type": FIXED_INCOME_QUOTE_TYPE} if asset_class in ("sovereign", "corporate") else {},
             "maturity_options_by_bond": maturity_by_bond}
+
+
+def rfq_field_schema(contract):
+    properties = contract["output_schema"]["properties"]
+    if contract["asset_class"] in MULTI_TRADE_ASSETS:
+        properties = properties["trades"]["items"]["properties"]
+    return properties["fields"]["properties"]
 
 
 def rfq_missing_fields(asset_class, values):
@@ -909,7 +931,7 @@ def rfq_missing_fields(asset_class, values):
 
 @dataclass(frozen=True)
 class RFQDraft:
-    fields: dict
+    fields: dict | list
     missing_fields: list
     metadata: dict
     relevant: bool = True
@@ -918,6 +940,10 @@ class RFQDraft:
 
 def interpret_rfq_json(asset_class, data, username, contract):
     """Validate model JSON against the same option values rendered in the form."""
+    if asset_class == "sovereign":
+        return interpret_sovereign_batch(data, username, contract)
+    if asset_class == "corporate":
+        return interpret_rfq_batch(asset_class, data, username, contract)
     values = rfq_empty_form(asset_class, username)
     expected = set(RFQ_FIELDS[asset_class])
     if (not isinstance(data, dict)
@@ -934,9 +960,52 @@ def interpret_rfq_json(asset_class, data, username, contract):
         return values, [], False, False
     if data["request_count"] != 1 or data["has_conflicts"]:
         return values, [], True, True
-    unresolved = set(data["unresolved_fields"]) - {"requester"}
-    properties = contract["output_schema"]["properties"]["fields"]["properties"]
-    for name, value in data["fields"].items():
+    values, missing = interpret_rfq_fields(asset_class, data["fields"], data["unresolved_fields"], username, contract)
+    return values, missing, True, False
+
+
+def interpret_sovereign_batch(data, username, contract):
+    return interpret_rfq_batch("sovereign", data, username, contract)
+
+
+def interpret_rfq_batch(asset_class, data, username, contract):
+    """Keep distinct trades separate, and report missing details by trade number."""
+    keys = {"asset_class", "is_rfq_request", "request_count", "has_conflicts", "trades"}
+    expected = set(RFQ_FIELDS[asset_class])
+    if (not isinstance(data, dict) or set(data) != keys or data.get("asset_class") != asset_class
+            or not isinstance(data.get("is_rfq_request"), bool)
+            or type(data.get("request_count")) is not int or data["request_count"] < 0
+            or not isinstance(data.get("has_conflicts"), bool) or not isinstance(data.get("trades"), list)):
+        raise AIError("The AI returned invalid RFQ JSON. Please try again.")
+    for trade in data["trades"]:
+        if (not isinstance(trade, dict) or set(trade) != {"fields", "unresolved_fields"}
+                or not isinstance(trade["fields"], dict) or set(trade["fields"]) != expected
+                or not isinstance(trade["unresolved_fields"], list)
+                or any(not isinstance(name, str) or name not in expected for name in trade["unresolved_fields"])):
+            raise AIError("The AI returned invalid RFQ JSON. Please try again.")
+    if not data["is_rfq_request"]:
+        if data["request_count"] or data["trades"]:
+            raise AIError("The AI returned inconsistent RFQ JSON. Please try again.")
+        return [], [], False, False
+    if data["has_conflicts"]:
+        return [], [], True, True
+    if data["request_count"] < 1 or data["request_count"] != len(data["trades"]):
+        raise AIError("The AI returned inconsistent RFQ JSON. Please try again.")
+    trades, missing = [], []
+    for number, trade in enumerate(data["trades"], 1):
+        fields, unresolved = interpret_rfq_fields(asset_class, trade["fields"], trade["unresolved_fields"], username, contract)
+        trades.append(fields)
+        if unresolved:
+            missing.append({"trade": number, "fields": unresolved})
+    return trades, missing, True, False
+
+
+def interpret_rfq_fields(asset_class, fields, unresolved_fields, username, contract):
+    """Normalize a single trade using the shared control definitions and catalog."""
+    values = rfq_empty_form(asset_class, username)
+    unresolved = set(unresolved_fields) - {"requester"}
+    properties = rfq_field_schema(contract)
+    for name, value in fields.items():
         if name == "requester" or value is None or name in unresolved:
             continue
         kind = contract["field_definitions"][name]["type"]
@@ -968,11 +1037,16 @@ def interpret_rfq_json(asset_class, data, username, contract):
             values["bond_name"] = bond
     for name in unresolved:
         values[name] = None if name not in SOLVE_FIELDS else False
+    if asset_class == "corporate":
+        # The hidden security input does not belong to this trade's selected category.
+        inactive = "security" if values.get("bond_type") == "Banking Instruments" else "security_text"
+        values[inactive] = None
+        unresolved.discard(inactive)
     missing = list(dict.fromkeys(sorted(unresolved) + rfq_missing_fields(asset_class, values)))
-    return values, missing, True, False
+    return values, missing
 
 
-def extract_rfq(asset_class, text, username, *, service=None, sovereign_assets=None):
+def extract_rfq(asset_class, text, username, *, service=None, sovereign_assets=None, corporate_options=None):
     if asset_class not in RFQ_FIELDS or not username:
         raise AIError("Sign in before filling an RFQ.")
     if not isinstance(text, str) or not text.strip():
@@ -980,7 +1054,7 @@ def extract_rfq(asset_class, text, username, *, service=None, sovereign_assets=N
     # HTML maxlength and the browser counter both count UTF-16 code units.
     if len(text.encode("utf-16-le", errors="surrogatepass")) // 2 > RFQ_AI_MAX_CHARS:
         raise AIError(f"Keep the RFQ description within {RFQ_AI_MAX_CHARS} characters.")
-    contract = rfq_json_contract(asset_class, username, sovereign_assets=sovereign_assets)
+    contract = rfq_json_contract(asset_class, username, sovereign_assets=sovereign_assets, corporate_options=corporate_options)
     prompt = PromptStore(DATABASE_PATH).get_active("rfq", f"fill_{asset_class}")
     payload = {"request_text": text.strip(), "requester_username": username, "form_contract": contract}
     request = build_structured_request(prompt=prompt, payload=payload,
@@ -997,8 +1071,6 @@ def extract_rfq(asset_class, text, username, *, service=None, sovereign_assets=N
         )
         fields, missing, relevant, ambiguous = interpret_rfq_json(asset_class, result.data, username, contract)
     except Exception as exc:
-        if isinstance(exc, AIError):
-            exc.ai_log_id = log_id
         invalid_response = result is not None or getattr(exc, "error_type", None) in {"InvalidJSON", "InvalidJSONShape"}
         audit.finish(log_id, status="invalid_response" if invalid_response else "failed", result=result, error=exc)
         raise
@@ -1010,39 +1082,26 @@ def extract_rfq(asset_class, text, username, *, service=None, sovereign_assets=N
     }, relevant, ambiguous)
 
 
-def log_rfq_form_event(message, *, source, form_type=None, current_user=None, level="error",
-                       ai_log_id=None, rfq_id=None, context=None, alert_type=None):
-    """Record user-facing warnings/errors after releasing business DB locks."""
-    try:
-        return FormEventLog(DATABASE_PATH).record(
-            feature="rfq", form_type=form_type, username=(current_user or {}).get("user") or "",
-            level=level, source=source, message=message, ai_log_id=ai_log_id,
-            rfq_id=rfq_id, context=context, alert_type=alert_type,
-        )
-    except sqlite3.Error as exc:
-        # A database outage must not hide the original alert from the user.
-        logger.error("Unable to save RFQ form event (%s)", type(exc).__name__)
-        return None
-
-
 def rfq_alert_text(component):
     if component is None:
         return ""
     if isinstance(component, (list, tuple)):
         return " ".join(filter(None, (rfq_alert_text(child) for child in component)))
+    if isinstance(component, dict) and "props" in component:
+        return rfq_alert_text(component["props"].get("children"))
     if hasattr(component, "children"):
         return rfq_alert_text(component.children)
     return str(component)
 
 
 class RFQQuoteValidationError(ValueError):
-    """A quote validation alert that must be logged outside the transaction."""
+    """An invalid broker quote that should be shown to the user."""
 
 
 def rfq_ai_panel(asset_class):
     examples = {
-        "sovereign": "Buy 500k LTN maturing January 2028, yield limit 12.5%. Use 500q for 500 units.",
-        "corporate": "Sell 2mm of [security code], yield limit 13%. Use 25q for 25 units.",
+        "sovereign": "Buy 500k b29; sell 25q f32. Include side and size for each trade.",
+        "corporate": "Buy 500k of [security code]; sell 25q of [another code]. Include side and size for each trade.",
         "derivatives": "Buy a 3-month DOL call, notional 10 million, premium 0.05, solve for strike, no barrier.",
     }
     return html.Div(
@@ -1051,6 +1110,7 @@ def rfq_ai_panel(asset_class):
         **{"aria-busy": "false"},
         children=[
             dcc.Store(id=f"rfq-ai-result-{asset_class}"),
+            dcc.Store(id=f"rfq-ai-ui-config-{asset_class}"),
             html.Div(
                 className="rfq-ai-heading",
                 children=[
@@ -1059,7 +1119,9 @@ def rfq_ai_panel(asset_class):
                 ],
             ),
             html.P(
-                "Describe one complete RFQ in English or Portuguese. Each AI run replaces the form with a fresh trade.",
+                (f"Describe one or more {asset_class} trades in English or Portuguese. Each AI run replaces all trade blocks."
+                 if asset_class in MULTI_TRADE_ASSETS else
+                 "Describe one complete RFQ in English or Portuguese. Each AI run replaces the form with a fresh trade."),
                 className="rfq-ai-hint",
             ),
             dcc.Textarea(
@@ -1111,7 +1173,9 @@ def rfq_form_modal(asset_class, title, children):
                     html.Div(
                         className="rfq-review-hint", role="status",
                         children=[html.Strong("Review trade details"),
-                                  html.Span("Check the values, then select Create RFQ.")],
+                                  html.Span("Check every block, then select Create RFQs."
+                                            if asset_class in MULTI_TRADE_ASSETS else
+                                            "Check the values, then select Create RFQ.")],
                     ),
                     *children[:-1],
                 ],
@@ -1121,12 +1185,485 @@ def rfq_form_modal(asset_class, title, children):
     )
 
 
+def sovereign_trade_block(trade_id=None, fields=None, assets=None, username="", number=1):
+    """Build every sovereign trade from the same controls used by the AI contract."""
+    grid = html.Div(
+        className="rfq-form-grid",
+        children=[
+            html.Fieldset(
+                className="rfq-fieldset",
+                children=[
+                    html.Legend(
+                        "Trade Type", className="rfq-fieldset-title"
+                    ),
+                    html.Div(
+                        className="rfq-fieldset-body",
+                        children=[
+                            html.Div(
+                                className="rfq-form-field",
+                                children=dmc.Stack(
+                                    [
+                                        dmc.Text(
+                                            "Direction",
+                                            className="rfq-form-label",
+                                        ),
+                                        dmc.SegmentedControl(
+                                            data=[
+                                                {
+                                                    "value": "Buy",
+                                                    "label": "Buy",
+                                                },
+                                                {
+                                                    "value": "Sell",
+                                                    "label": "Sell",
+                                                },
+                                            ],
+                                            value=None,
+                                            className="rfq-segment",
+                                            fullWidth=True,
+                                            id="rfq-direction-sovereign",
+                                        ),
+                                    ],
+                                    align="flex-start",
+                                    gap="xs",
+                                ),
+                            ),
+                            html.Div(
+                                className="rfq-form-field",
+                                children=[
+                                    html.Div(
+                                        "Quote Requester",
+                                        className="rfq-form-label",
+                                    ),
+                                    dcc.Input(
+                                        id="rfq-requester-sovereign",
+                                        className="rfq-input",
+                                        type="text",
+                                        readOnly=True,
+                                        placeholder="Signed-in username",
+                                    ),
+                                ],
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+            html.Fieldset(
+                className="rfq-fieldset",
+                children=[
+                    html.Legend(
+                        "Traded Security",
+                        className="rfq-fieldset-title",
+                    ),
+                    html.Div(
+                        className="rfq-fieldset-body",
+                        children=[
+                            html.Div(
+                                className="rfq-form-field",
+                                children=dmc.Stack(
+                                    [
+                                        dmc.Text(
+                                            "Bond Name",
+                                            className="rfq-form-label",
+                                        ),
+                                        dmc.SegmentedControl(
+                                            data=[],
+                                            value=None,
+                                            className="rfq-segment",
+                                            fullWidth=True,
+                                            id="rfq-bond-name-sovereign",
+                                        ),
+                                    ],
+                                    align="flex-start",
+                                    gap="xs",
+                                ),
+                            ),
+                            html.Div(
+                                className="rfq-form-field",
+                                children=[
+                                    html.Div(
+                                        "Maturity Date",
+                                        className="rfq-form-label",
+                                    ),
+                                    dcc.Dropdown(
+                                        className="rfq-input rfq-select",
+                                        options=[],
+                                        value=None,
+                                        placeholder="Select maturity date",
+                                        clearable=False,
+                                        maxHeight=420,
+                                        id="rfq-maturity-sovereign",
+                                    ),
+                                ],
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+            html.Fieldset(
+                className="rfq-fieldset",
+                children=[
+                    html.Legend(
+                        "Trade Definition",
+                        className="rfq-fieldset-title",
+                    ),
+                    html.Div(
+                        className="rfq-fieldset-body",
+                        children=[
+                            html.Div(
+                                className="rfq-form-field",
+                                children=[
+                                    html.Div(
+                                        "Quantity (optional)",
+                                        className="rfq-form-label",
+                                    ),
+                                    dmc.NumberInput(
+                                        className="rfq-number-input",
+                                        classNames={"input": "rfq-input"},
+                                        placeholder='e.g., 50,000,000',
+                                        thousandSeparator=",",
+                                        hideControls=True,
+                                        allowNegative=False,
+                                        allowDecimal=False,
+                                        id="rfq-qty-sovereign",
+                                    ),
+                                ],
+                            ),
+                            html.Div(
+                                className="rfq-form-field",
+                                children=[
+                                    html.Div(
+                                        "Volume (optional)",
+                                        className="rfq-form-label",
+                                    ),
+                                    dmc.NumberInput(
+                                        className="rfq-number-input",
+                                        classNames={"input": "rfq-input"},
+                                        placeholder='e.g., 1,000,000',
+                                        thousandSeparator=",",
+                                        hideControls=True,
+                                        allowNegative=False,
+                                        allowDecimal=True,
+                                        id="rfq-volume-sovereign",
+                                    ),
+                                ],
+                            ),
+                            html.Div(
+                                className="rfq-form-field",
+                                children=[
+                                    html.Div(
+                                        "Client Yield Limit (optional)",
+                                        className="rfq-form-label",
+                                    ),
+                                    dcc.Input(
+                                        className="rfq-input",
+                                        placeholder="e.g., 6.50",
+                                        type="number",
+                                        step="0.01",
+                                        id="rfq-limit-sovereign",
+                                    ),
+                                ],
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    )
+    return fixed_income_trade_block("sovereign", grid, trade_id, fields, assets, username, number)
+
+
+def corporate_trade_block(trade_id=None, fields=None, assets=None, username="", number=1):
+    """Use one set of corporate controls for every block and the AI contract."""
+    grid = html.Div(
+        className="rfq-form-grid",
+        children=[
+            html.Fieldset(
+                className="rfq-fieldset",
+                children=[
+                    html.Legend(
+                        "Trade Type", className="rfq-fieldset-title"
+                    ),
+                    html.Div(
+                        className="rfq-fieldset-body",
+                        children=[
+                            html.Div(
+                                className="rfq-form-field",
+                                children=dmc.Stack(
+                                    [
+                                        dmc.Text(
+                                            "Direction",
+                                            className="rfq-form-label",
+                                        ),
+                                        dmc.SegmentedControl(
+                                            data=[
+                                                {
+                                                    "value": "Buy",
+                                                    "label": "Buy",
+                                                },
+                                                {
+                                                    "value": "Sell",
+                                                    "label": "Sell",
+                                                },
+                                            ],
+                                            value=None,
+                                            className="rfq-segment",
+                                            fullWidth=True,
+                                            id="rfq-direction-corporate",
+                                        ),
+                                    ],
+                                    align="flex-start",
+                                    gap="xs",
+                                ),
+                            ),
+                            html.Div(
+                                className="rfq-form-field",
+                                children=[
+                                    html.Div(
+                                        "Quote Requester",
+                                        className="rfq-form-label",
+                                    ),
+                                    dcc.Input(
+                                        id="rfq-requester-corporate",
+                                        className="rfq-input",
+                                        type="text",
+                                        readOnly=True,
+                                        placeholder="Signed-in username",
+                                    ),
+                                ],
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+            html.Fieldset(
+                className="rfq-fieldset",
+                children=[
+                    html.Legend(
+                        "Traded Security",
+                        className="rfq-fieldset-title",
+                    ),
+                    html.Div(
+                        className="rfq-fieldset-body",
+                        children=[
+                            html.Div(
+                                className="rfq-form-field",
+                                children=dmc.Stack(
+                                    [
+                                        dmc.Text(
+                                            "Bond Type",
+                                            className="rfq-form-label",
+                                        ),
+                                        dmc.SegmentedControl(
+                                            data=[
+                                                {
+                                                    "value": "Banking Instruments",
+                                                    "label": "Banking Instruments",
+                                                },
+                                                {
+                                                    "value": "Corporate Bonds",
+                                                    "label": "Corporate Bonds",
+                                                },
+                                            ],
+                                            value=None,
+                                            className="rfq-segment",
+                                            fullWidth=True,
+                                            id="rfq-bond-type-corporate",
+                                        ),
+                                    ],
+                                    align="flex-start",
+                                    gap="xs",
+                                ),
+                            ),
+                            html.Div(
+                                id="rfq-corp-security-text-wrap",
+                                className="rfq-form-field",
+                                children=[
+                                    html.Div(
+                                        "Security Name",
+                                        className="rfq-form-label",
+                                    ),
+                                    dcc.Input(
+                                        className="rfq-input",
+                                        placeholder="e.g., CDB Banco X 1y %CDI",
+                                        type="text",
+                                        id="rfq-corp-security-text",
+                                    ),
+                                ],
+                            ),
+                            html.Div(
+                                id="rfq-corp-security-dropdown-wrap",
+                                className="rfq-form-field",
+                                children=[
+                                    html.Div(
+                                        "Security",
+                                        className="rfq-form-label",
+                                    ),
+                                    dcc.Dropdown(
+                                        className="rfq-input rfq-select",
+                                        options=[],
+                                        value=None,
+                                        clearable=False,
+                                        maxHeight=420,
+                                        id="rfq-corp-security-dropdown",
+                                    ),
+                                ],
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+            html.Fieldset(
+                className="rfq-fieldset",
+                children=[
+                    html.Legend(
+                        "Trade Definition",
+                        className="rfq-fieldset-title",
+                    ),
+                    html.Div(
+                        className="rfq-fieldset-body",
+                        children=[
+                            html.Div(
+                                className="rfq-form-field",
+                                children=[
+                                    html.Div(
+                                        "Quantity (optional)",
+                                        className="rfq-form-label",
+                                    ),
+                                    dmc.NumberInput(
+                                        className="rfq-number-input",
+                                        classNames={"input": "rfq-input"},
+                                        placeholder='e.g., 20,000,000',
+                                        thousandSeparator=",",
+                                        hideControls=True,
+                                        allowNegative=False,
+                                        allowDecimal=False,
+                                        id="rfq-qty-corporate",
+                                    ),
+                                ],
+                            ),
+                            html.Div(
+                                className="rfq-form-field",
+                                children=[
+                                    html.Div(
+                                        "Volume (optional)",
+                                        className="rfq-form-label",
+                                    ),
+                                    dmc.NumberInput(
+                                        className="rfq-number-input",
+                                        classNames={"input": "rfq-input"},
+                                        placeholder='e.g., 5,000,000',
+                                        thousandSeparator=",",
+                                        hideControls=True,
+                                        allowNegative=False,
+                                        allowDecimal=True,
+                                        id="rfq-volume-corporate",
+                                    ),
+                                ],
+                            ),
+                            html.Div(
+                                className="rfq-form-field",
+                                children=[
+                                    html.Div(
+                                        "Client Yield Limit (optional)",
+                                        className="rfq-form-label",
+                                    ),
+                                    dcc.Input(
+                                        className="rfq-input",
+                                        placeholder="e.g., 6.50",
+                                        type="number",
+                                        step="0.01",
+                                        id="rfq-limit-corporate",
+                                    ),
+                                ],
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    )
+    return fixed_income_trade_block("corporate", grid, trade_id, fields, assets, username, number)
+
+
+def fixed_income_trade_block(asset_class, grid, trade_id, fields, assets, username, number):
+    if trade_id is None:
+        return grid
+    fields = fields or {}
+    bonds, maturities = sovereign_form_options(assets) if asset_class == "sovereign" else ([], {})
+    names = {component_id: name for name, component_id in RFQ_FIELDS[asset_class].items()}
+    banking = fields.get("bond_type") == "Banking Instruments"
+
+    def populate(component):
+        if isinstance(component, (list, tuple)):
+            for child in component:
+                populate(child)
+        elif hasattr(component, "to_plotly_json"):
+            component_id = getattr(component, "id", None)
+            name = names.get(component_id)
+            if name:
+                component.id = rfq_trade_field_id(asset_class, name, trade_id)
+                component.value = username if name == "requester" else fields.get(name)
+                if asset_class == "sovereign" and name == "bond_name":
+                    component.data = bonds
+                elif asset_class == "sovereign" and name == "maturity":
+                    component.options = maturities.get(fields.get("bond_name"), [])
+                elif asset_class == "corporate" and name == "security":
+                    component.options = assets or []
+            elif asset_class == "corporate" and component_id in (
+                "rfq-corp-security-text-wrap", "rfq-corp-security-dropdown-wrap"
+            ):
+                text_input = component_id == "rfq-corp-security-text-wrap"
+                component.id = {"type": f"rfq-corporate-security-{'text' if text_input else 'dropdown'}-wrap", "trade": trade_id}
+                component.style = {"display": "block" if text_input == banking else "none"}
+            populate(getattr(component, "children", None))
+
+    populate(grid)
+    return html.Div(
+        id={"type": f"rfq-{asset_class}-trade", "trade": trade_id},
+        className="rfq-trade-block",
+        children=[
+            html.Div(className="rfq-trade-heading", children=[
+                html.Strong(f"Trade {number}"),
+                html.Button(
+                    html.Span("−", **{"aria-hidden": "true"}),
+                    id={"type": f"rfq-{asset_class}-remove", "trade": trade_id},
+                    className="rfq-remove-trade", type="button", n_clicks=0,
+                    title="Remove this trade", **{"aria-label": f"Remove trade {number}"},
+                ),
+            ]),
+            grid,
+        ],
+    )
+
+
+def rfq_trade_field_id(asset_class, field, trade):
+    return {"type": f"rfq-{asset_class}-field", "field": field, "trade": trade}
+
+
+def sovereign_field_id(field, trade):
+    return rfq_trade_field_id("sovereign", field, trade)
+
+
+def corporate_field_id(field, trade):
+    return rfq_trade_field_id("corporate", field, trade)
+
+
+def rfq_add_trade_button(asset_class):
+    return html.Button(
+        html.Span("+", **{"aria-hidden": "true"}),
+        id=f"rfq-{asset_class}-add", className="rfq-add-trade", type="button", n_clicks=0,
+        title="Add trade", **{"aria-label": "Add trade", "aria-controls": f"rfq-{asset_class}-trades"},
+    )
+
+
 layout = dbc.Container(
     fluid=True,
     className="page-container rfq-page",
     children=[
         dcc.Store(id="rfq-refresh", data=0),
         dcc.Store(id="rfq-sovereign-assets", data=[]),
+        dcc.Store(id="rfq-corporate-options", data=[]),
         dcc.Clipboard(id="rfq-copy-clipboard", style={"display": "none"}),
         dcc.Store(id="rfq-grid-copy-result"),
         dcc.Store(id="rfq-copy-text", data=""),
@@ -1184,191 +1721,10 @@ layout = dbc.Container(
             ],
         ),
         rfq_form_modal(
-            "sovereign", "New Sovereign Bonds RFQ",
+            "sovereign", "New Sovereign Bonds RFQs",
             children=[
-                html.Div(
-                    className="rfq-form-grid",
-                    children=[
-                        html.Fieldset(
-                            className="rfq-fieldset",
-                            children=[
-                                html.Legend(
-                                    "Trade Type", className="rfq-fieldset-title"
-                                ),
-                                html.Div(
-                                    className="rfq-fieldset-body",
-                                    children=[
-                                        html.Div(
-                                            className="rfq-form-field",
-                                            children=dmc.Stack(
-                                                [
-                                                    dmc.Text(
-                                                        "Direction",
-                                                        className="rfq-form-label",
-                                                    ),
-                                                    dmc.SegmentedControl(
-                                                        data=[
-                                                            {
-                                                                "value": "Buy",
-                                                                "label": "Buy",
-                                                            },
-                                                            {
-                                                                "value": "Sell",
-                                                                "label": "Sell",
-                                                            },
-                                                        ],
-                                                        value=None,
-                                                        className="rfq-segment",
-                                                        fullWidth=True,
-                                                        id="rfq-direction-sovereign",
-                                                    ),
-                                                ],
-                                                align="flex-start",
-                                                gap="xs",
-                                            ),
-                                        ),
-                                        html.Div(
-                                            className="rfq-form-field",
-                                            children=[
-                                                html.Div(
-                                                    "Quote Requester",
-                                                    className="rfq-form-label",
-                                                ),
-                                                dcc.Input(
-                                                    id="rfq-requester-sovereign",
-                                                    className="rfq-input",
-                                                    type="text",
-                                                    readOnly=True,
-                                                    placeholder="Signed-in username",
-                                                ),
-                                            ],
-                                        ),
-                                    ],
-                                ),
-                            ],
-                        ),
-                        html.Fieldset(
-                            className="rfq-fieldset",
-                            children=[
-                                html.Legend(
-                                    "Traded Security",
-                                    className="rfq-fieldset-title",
-                                ),
-                                html.Div(
-                                    className="rfq-fieldset-body",
-                                    children=[
-                                        html.Div(
-                                            className="rfq-form-field",
-                                            children=dmc.Stack(
-                                                [
-                                                    dmc.Text(
-                                                        "Bond Name",
-                                                        className="rfq-form-label",
-                                                    ),
-                                                    dmc.SegmentedControl(
-                                                        data=[],
-                                                        value=None,
-                                                        className="rfq-segment",
-                                                        fullWidth=True,
-                                                        id="rfq-bond-name-sovereign",
-                                                    ),
-                                                ],
-                                                align="flex-start",
-                                                gap="xs",
-                                            ),
-                                        ),
-                                        html.Div(
-                                            className="rfq-form-field",
-                                            children=[
-                                                html.Div(
-                                                    "Maturity Date",
-                                                    className="rfq-form-label",
-                                                ),
-                                                dcc.Dropdown(
-                                                    className="rfq-input rfq-select",
-                                                    options=[],
-                                                    value=None,
-                                                    placeholder="Select maturity date",
-                                                    clearable=False,
-                                                    maxHeight=420,
-                                                    id="rfq-maturity-sovereign",
-                                                ),
-                                            ],
-                                        ),
-                                    ],
-                                ),
-                            ],
-                        ),
-                        html.Fieldset(
-                            className="rfq-fieldset",
-                            children=[
-                                html.Legend(
-                                    "Trade Definition",
-                                    className="rfq-fieldset-title",
-                                ),
-                                html.Div(
-                                    className="rfq-fieldset-body",
-                                    children=[
-                                        html.Div(
-                                            className="rfq-form-field",
-                                            children=[
-                                                html.Div(
-                                                    "Quantity (optional)",
-                                                    className="rfq-form-label",
-                                                ),
-                                                dmc.NumberInput(
-                                                    className="rfq-number-input",
-                                                    classNames={"input": "rfq-input"},
-                                                    placeholder='e.g., 50,000,000',
-                                                    thousandSeparator=",",
-                                                    hideControls=True,
-                                                    allowNegative=False,
-                                                    allowDecimal=False,
-                                                    id="rfq-qty-sovereign",
-                                                ),
-                                            ],
-                                        ),
-                                        html.Div(
-                                            className="rfq-form-field",
-                                            children=[
-                                                html.Div(
-                                                    "Volume (optional)",
-                                                    className="rfq-form-label",
-                                                ),
-                                                dmc.NumberInput(
-                                                    className="rfq-number-input",
-                                                    classNames={"input": "rfq-input"},
-                                                    placeholder='e.g., 1,000,000',
-                                                    thousandSeparator=",",
-                                                    hideControls=True,
-                                                    allowNegative=False,
-                                                    allowDecimal=True,
-                                                    id="rfq-volume-sovereign",
-                                                ),
-                                            ],
-                                        ),
-                                        html.Div(
-                                            className="rfq-form-field",
-                                            children=[
-                                                html.Div(
-                                                    "Client Yield Limit (optional)",
-                                                    className="rfq-form-label",
-                                                ),
-                                                dcc.Input(
-                                                    className="rfq-input",
-                                                    placeholder="e.g., 6.50",
-                                                    type="number",
-                                                    step="0.01",
-                                                    id="rfq-limit-sovereign",
-                                                ),
-                                            ],
-                                        ),
-                                    ],
-                                ),
-                            ],
-                        ),
-                    ],
-                ),
+                html.Div(id="rfq-sovereign-trades", children=[sovereign_trade_block("initial")]),
+                rfq_add_trade_button("sovereign"),
                 html.Div(
                     className="rfq-form-actions",
                     children=[
@@ -1379,7 +1735,7 @@ layout = dbc.Container(
                             type="button",
                         ),
                         html.Button(
-                            "Create RFQ",
+                            "Create RFQs",
                             className="rfq-primary-btn",
                             type="button",
                             id="rfq-submit-sovereign",
@@ -1389,216 +1745,10 @@ layout = dbc.Container(
             ],
         ),
         rfq_form_modal(
-            "corporate", "New Corporate Bonds RFQ",
+            "corporate", "New Corporate Bonds RFQs",
             children=[
-                html.Div(
-                    className="rfq-form-grid",
-                    children=[
-                        html.Fieldset(
-                            className="rfq-fieldset",
-                            children=[
-                                html.Legend(
-                                    "Trade Type", className="rfq-fieldset-title"
-                                ),
-                                html.Div(
-                                    className="rfq-fieldset-body",
-                                    children=[
-                                        html.Div(
-                                            className="rfq-form-field",
-                                            children=dmc.Stack(
-                                                [
-                                                    dmc.Text(
-                                                        "Direction",
-                                                        className="rfq-form-label",
-                                                    ),
-                                                    dmc.SegmentedControl(
-                                                        data=[
-                                                            {
-                                                                "value": "Buy",
-                                                                "label": "Buy",
-                                                            },
-                                                            {
-                                                                "value": "Sell",
-                                                                "label": "Sell",
-                                                            },
-                                                        ],
-                                                        value=None,
-                                                        className="rfq-segment",
-                                                        fullWidth=True,
-                                                        id="rfq-direction-corporate",
-                                                    ),
-                                                ],
-                                                align="flex-start",
-                                                gap="xs",
-                                            ),
-                                        ),
-                                        html.Div(
-                                            className="rfq-form-field",
-                                            children=[
-                                                html.Div(
-                                                    "Quote Requester",
-                                                    className="rfq-form-label",
-                                                ),
-                                                dcc.Input(
-                                                    id="rfq-requester-corporate",
-                                                    className="rfq-input",
-                                                    type="text",
-                                                    readOnly=True,
-                                                    placeholder="Signed-in username",
-                                                ),
-                                            ],
-                                        ),
-                                    ],
-                                ),
-                            ],
-                        ),
-                        html.Fieldset(
-                            className="rfq-fieldset",
-                            children=[
-                                html.Legend(
-                                    "Traded Security",
-                                    className="rfq-fieldset-title",
-                                ),
-                                html.Div(
-                                    className="rfq-fieldset-body",
-                                    children=[
-                                        html.Div(
-                                            className="rfq-form-field",
-                                            children=dmc.Stack(
-                                                [
-                                                    dmc.Text(
-                                                        "Bond Type",
-                                                        className="rfq-form-label",
-                                                    ),
-                                                    dmc.SegmentedControl(
-                                                        data=[
-                                                            {
-                                                                "value": "Banking Instruments",
-                                                                "label": "Banking Instruments",
-                                                            },
-                                                            {
-                                                                "value": "Corporate Bonds",
-                                                                "label": "Corporate Bonds",
-                                                            },
-                                                        ],
-                                                        value=None,
-                                                        className="rfq-segment",
-                                                        fullWidth=True,
-                                                        id="rfq-bond-type-corporate",
-                                                    ),
-                                                ],
-                                                align="flex-start",
-                                                gap="xs",
-                                            ),
-                                        ),
-                                        html.Div(
-                                            id="rfq-corp-security-text-wrap",
-                                            className="rfq-form-field",
-                                            children=[
-                                                html.Div(
-                                                    "Security Name",
-                                                    className="rfq-form-label",
-                                                ),
-                                                dcc.Input(
-                                                    className="rfq-input",
-                                                    placeholder="e.g., CDB Banco X 1y %CDI",
-                                                    type="text",
-                                                    id="rfq-corp-security-text",
-                                                ),
-                                            ],
-                                        ),
-                                        html.Div(
-                                            id="rfq-corp-security-dropdown-wrap",
-                                            className="rfq-form-field",
-                                            children=[
-                                                html.Div(
-                                                    "Security",
-                                                    className="rfq-form-label",
-                                                ),
-                                                dcc.Dropdown(
-                                                    className="rfq-input rfq-select",
-                                                    options=load_corporate_security_options(),
-                                                    value=None,
-                                                    clearable=False,
-                                                    maxHeight=420,
-                                                    id="rfq-corp-security-dropdown",
-                                                ),
-                                            ],
-                                        ),
-                                    ],
-                                ),
-                            ],
-                        ),
-                        html.Fieldset(
-                            className="rfq-fieldset",
-                            children=[
-                                html.Legend(
-                                    "Trade Definition",
-                                    className="rfq-fieldset-title",
-                                ),
-                                html.Div(
-                                    className="rfq-fieldset-body",
-                                    children=[
-                                        html.Div(
-                                            className="rfq-form-field",
-                                            children=[
-                                                html.Div(
-                                                    "Quantity (optional)",
-                                                    className="rfq-form-label",
-                                                ),
-                                                dmc.NumberInput(
-                                                    className="rfq-number-input",
-                                                    classNames={"input": "rfq-input"},
-                                                    placeholder='e.g., 20,000,000',
-                                                    thousandSeparator=",",
-                                                    hideControls=True,
-                                                    allowNegative=False,
-                                                    allowDecimal=False,
-                                                    id="rfq-qty-corporate",
-                                                ),
-                                            ],
-                                        ),
-                                        html.Div(
-                                            className="rfq-form-field",
-                                            children=[
-                                                html.Div(
-                                                    "Volume (optional)",
-                                                    className="rfq-form-label",
-                                                ),
-                                                dmc.NumberInput(
-                                                    className="rfq-number-input",
-                                                    classNames={"input": "rfq-input"},
-                                                    placeholder='e.g., 5,000,000',
-                                                    thousandSeparator=",",
-                                                    hideControls=True,
-                                                    allowNegative=False,
-                                                    allowDecimal=True,
-                                                    id="rfq-volume-corporate",
-                                                ),
-                                            ],
-                                        ),
-                                        html.Div(
-                                            className="rfq-form-field",
-                                            children=[
-                                                html.Div(
-                                                    "Client Yield Limit (optional)",
-                                                    className="rfq-form-label",
-                                                ),
-                                                dcc.Input(
-                                                    className="rfq-input",
-                                                    placeholder="e.g., 6.50",
-                                                    type="number",
-                                                    step="0.01",
-                                                    id="rfq-limit-corporate",
-                                                ),
-                                            ],
-                                        ),
-                                    ],
-                                ),
-                            ],
-                        ),
-                    ],
-                ),
+                html.Div(id="rfq-corporate-trades", children=[corporate_trade_block("initial")]),
+                rfq_add_trade_button("corporate"),
                 html.Div(
                     className="rfq-form-actions",
                     children=[
@@ -1609,7 +1759,7 @@ layout = dbc.Container(
                             type="button",
                         ),
                         html.Button(
-                            "Create RFQ",
+                            "Create RFQs",
                             className="rfq-primary-btn",
                             type="button",
                             id="rfq-submit-corporate",
@@ -1954,75 +2104,59 @@ def toggle_rfq_auth_content(current_user):
 
 
 def register_rfq_ai_callback(asset_class):
+    direct_fields = {} if asset_class in MULTI_TRADE_ASSETS else {
+        name: component_id for name, component_id in RFQ_FIELDS[asset_class].items() if name != "requester"
+    }
+    reset_values = rfq_empty_form(asset_class, "")
+    reset_outputs = [Output(component_id, "value", allow_duplicate=True) for component_id in direct_fields.values()]
+    reset_outputs += [Output(f"rfq-ai-result-{asset_class}", "data", allow_duplicate=True),
+                      Output(f"rfq-ai-status-{asset_class}", "children", allow_duplicate=True),
+                      Output(f"rfq-ai-text-{asset_class}", "value")]
+    reset_payload = [(["solve"] if reset_values[name] else []) if name in SOLVE_FIELDS else reset_values[name]
+                     for name in direct_fields] + [None, ""]
+    # Form settings remain in this page; shared JS callbacks use stable names.
+    rfq_components()[f"rfq-ai-ui-config-{asset_class}"].data = {
+        "counter": {"limit": RFQ_AI_MAX_CHARS, "className": "rfq-ai-count",
+                    "limitClass": " rfq-ai-count-limit", "overClass": " rfq-ai-count-over"},
+        "stages": {
+            "idle": ["rfq-ai-panel", "rfq-fields-shell", "Describe your RFQ"],
+            "running": ["rfq-ai-panel rfq-ai-running", "rfq-fields-shell", "Filling form…"],
+            "review": ["rfq-ai-panel rfq-ai-complete", "rfq-fields-shell rfq-fields-review",
+                       "Review trades below" if asset_class in MULTI_TRADE_ASSETS else "Review trade below"],
+        },
+        "reset": {"openedProp": f"rfq-form-{asset_class}.opened",
+                  "applyProp": f"rfq-ai-apply-{asset_class}.n_clicks", "values": reset_payload},
+    }
+    config = State(f"rfq-ai-ui-config-{asset_class}", "data")
     clientside_callback(
-        """function(value) {
-            const count = (value || "").length;
-            const limit = %d;
-            const state = count > limit ? " rfq-ai-count-over" : count === limit ? " rfq-ai-count-limit" : "";
-            return [count + " / " + limit, "rfq-ai-count" + state];
-        }""" % RFQ_AI_MAX_CHARS,
+        ClientsideFunction(namespace="formControls", function_name="countText"),
         Output(f"rfq-ai-count-{asset_class}", "children"),
         Output(f"rfq-ai-count-{asset_class}", "className"),
-        Input(f"rfq-ai-text-{asset_class}", "value"),
+        Input(f"rfq-ai-text-{asset_class}", "value"), config,
     )
-    # One callback owns presentation so the end of the running state cannot
-    # overwrite the review highlight returned after the form has been filled.
+    # One callback owns presentation so runningOff cannot erase the review shading.
     clientside_callback(
-        """function(result, busy) {
-            if (busy === "true") {
-                return ["rfq-ai-panel rfq-ai-running", "rfq-fields-shell", "Filling form…"];
-            }
-            if (result && result.review) {
-                return ["rfq-ai-panel rfq-ai-complete", "rfq-fields-shell rfq-fields-review", "Review trade below"];
-            }
-            return ["rfq-ai-panel", "rfq-fields-shell", "Describe your RFQ"];
-        }""",
+        ClientsideFunction(namespace="formControls", function_name="presentAIState"),
         Output(f"rfq-ai-panel-{asset_class}", "className"),
         Output(f"rfq-fields-{asset_class}", "className"),
         Output(f"rfq-ai-stage-{asset_class}", "children"),
         Input(f"rfq-ai-result-{asset_class}", "data"),
-        Input(f"rfq-ai-panel-{asset_class}", "aria-busy"),
+        Input(f"rfq-ai-panel-{asset_class}", "aria-busy"), config,
     )
-    dependent = {"requester", "maturity"} if asset_class == "sovereign" else {"requester"}
-    direct_fields = {name: component_id for name, component_id in RFQ_FIELDS[asset_class].items() if name not in dependent}
-    reset_values = rfq_empty_form(asset_class, "")
-    reset_outputs = [Output(component_id, "value", allow_duplicate=True) for component_id in direct_fields.values()]
-    reset_outputs += [Output(f"rfq-ai-result-{asset_class}", "data", allow_duplicate=True),
-                      Output(f"rfq-ai-status-{asset_class}", "children", allow_duplicate=True)]
-    reset_payload = [(["solve"] if reset_values[name] else []) if name in SOLVE_FIELDS else reset_values[name]
-                     for name in direct_fields] + [None, ""]
-    reset_outputs.append(Output(f"rfq-ai-text-{asset_class}", "value"))
-    # Opening clears the draft and description; Apply clears only the trade fields.
-    reset_script = """function(n, opened) {
-        const changed = window.dash_clientside.callback_context.triggered;
-        const opening = opened && changed.some(item => item.prop_id === %s);
-        const applying = changed.some(item => item.prop_id === %s);
-        if (!opening && !applying) {
-            return Array(%d).fill(window.dash_clientside.no_update);
-        }
-        const values = %s;
-        values.push(opening ? "" : window.dash_clientside.no_update);
-        return values;
-    }""" % (json.dumps(f"rfq-form-{asset_class}.opened"),
-             json.dumps(f"rfq-ai-apply-{asset_class}.n_clicks"),
-             len(reset_outputs), json.dumps(reset_payload))
+    # Opening clears the description too; Apply keeps it and replaces all trades.
     clientside_callback(
-        reset_script, reset_outputs,
+        ClientsideFunction(namespace="formControls", function_name="resetAIForm"), reset_outputs,
         Input(f"rfq-ai-apply-{asset_class}", "n_clicks"),
-        Input(f"rfq-form-{asset_class}", "opened"), prevent_initial_call=True,
+        Input(f"rfq-form-{asset_class}", "opened"), config, prevent_initial_call=True,
     )
-    dynamic_options = []
-    if asset_class == "corporate":
-        dynamic_options = [Output("rfq-corp-security-dropdown", "options")]
-
     @callback(
         [Output(component_id, "value") for component_id in direct_fields.values()]
         + [Output(f"rfq-ai-result-{asset_class}", "data"),
-           Output(f"rfq-ai-status-{asset_class}", "children")] + dynamic_options,
+           Output(f"rfq-ai-status-{asset_class}", "children")],
         Input(f"rfq-ai-apply-{asset_class}", "n_clicks"),
         [State(f"rfq-ai-text-{asset_class}", "value"),
-         State("current-user", "data"), State(f"rfq-form-{asset_class}", "opened")]
-        + ([State("rfq-sovereign-assets", "data")] if asset_class == "sovereign" else []),
+         State("current-user", "data"), State(f"rfq-form-{asset_class}", "opened"),
+         State("rfq-sovereign-assets", "data"), State("rfq-corporate-options", "data")],
         prevent_initial_call=True,
         running=[
             (Output(f"rfq-ai-panel-{asset_class}", "aria-busy"), "true", "false"),
@@ -2036,75 +2170,74 @@ def register_rfq_ai_callback(asset_class):
             (Output(f"rfq-form-{asset_class}", "withCloseButton"), False, True),
         ],
     )
-    def fill_rfq_form(_clicks, text, current_user, opened, sovereign_assets=None):
+    def fill_rfq_form(_clicks, text, current_user, opened, sovereign_assets=None, corporate_options=None):
         if not opened or not current_user or not current_user.get("user"):
             raise PreventUpdate
         username = current_user["user"]
-        fields = rfq_empty_form(asset_class, username)
+        fields = [] if asset_class in MULTI_TRADE_ASSETS else rfq_empty_form(asset_class, username)
         metadata = {}
         review = False
-        alert_level = None
         alert_type = None
-        alert_log_id = None
-        alert_context = {"request_text": text}
         try:
-            draft = extract_rfq(asset_class, text, username, sovereign_assets=sovereign_assets)
+            draft = extract_rfq(asset_class, text, username, sovereign_assets=sovereign_assets, corporate_options=corporate_options)
             fields, metadata = draft.fields, draft.metadata
-            alert_log_id = metadata.get("log_id")
+            trade_fields = fields if asset_class in MULTI_TRADE_ASSETS else [fields]
             review = draft.relevant and not draft.ambiguous and any(
-                value not in (None, "") for name, value in fields.items()
+                value not in (None, "") for trade in trade_fields for name, value in trade.items()
                 if name != "requester" and name not in SOLVE_FIELDS
             )
             if draft.ambiguous:
-                alert_level = "warning"
                 alert_type = "ConflictingRFQs"
                 status = html.Span(
-                    "Several RFQs or conflicting details were found. The form was reset. Describe one complete trade and apply again.",
+                    ("Conflicting details were found within a trade. The form was reset. Clarify each trade and apply again."
+                     if asset_class in MULTI_TRADE_ASSETS else
+                     "Several RFQs or conflicting details were found. The form was reset. Describe one complete trade and apply again."),
                     className="rfq-ai-needs-details",
                 )
             elif not draft.relevant:
-                alert_level = "warning"
                 alert_type = "UnrelatedRequest"
                 status = html.Span(
+                    f"Describe {asset_class} trades with security, side, and size. The form was reset."
+                    if asset_class in MULTI_TRADE_ASSETS else
                     "Describe one RFQ: security, side, size, and any pricing details. The form was reset.",
                     className="rfq-ai-needs-details",
                 )
             elif draft.missing_fields:
-                alert_level = "warning"
                 alert_type = "MissingRFQDetails"
-                alert_context["missing_fields"] = draft.missing_fields
                 status = html.Div([
                     html.Strong("Please specify the following details:"),
-                    html.Ul([html.Li(FIELD_LABELS[name]) for name in draft.missing_fields]),
-                    html.Span("Include them in a complete RFQ description and apply again. Each run starts fresh."),
+                    html.Ul([
+                        html.Li(f"Trade {item['trade']}: " + ", ".join(FIELD_LABELS[name] for name in item["fields"]))
+                        for item in draft.missing_fields
+                    ] if asset_class in MULTI_TRADE_ASSETS else [html.Li(FIELD_LABELS[name]) for name in draft.missing_fields]),
+                    html.Span("Complete the highlighted trades manually, or include the missing details and apply again. Each run starts fresh."
+                              if asset_class in MULTI_TRADE_ASSETS else
+                              "Include them in a complete RFQ description and apply again. Each run starts fresh."),
                 ], className="rfq-ai-needs-details")
             else:
                 status = html.Span(
-                    "Fields applied. Review the trade details below, then select Create RFQ.", className="rfq-ai-success",
+                    (f"{len(fields)} trade(s) applied. Review every block below, then select Create RFQs."
+                     if asset_class in MULTI_TRADE_ASSETS else
+                     "Fields applied. Review the trade details below, then select Create RFQ."), className="rfq-ai-success",
                 )
         except AIConfigurationError as exc:
-            alert_level = "error"
-            alert_log_id = getattr(exc, "ai_log_id", None)
-            alert_context["error_type"] = type(exc).__name__
             logger.warning("RFQ AI configuration: %s", exc)
             status = html.Span("AI assistance is unavailable. The form was reset; you can fill it manually.", className="rfq-ai-error")
         except (AIError, sqlite3.Error, LookupError) as exc:
-            alert_level = "error"
-            alert_log_id = getattr(exc, "ai_log_id", None)
-            alert_context["error_type"] = type(exc).__name__
             logger.warning("RFQ AI request failed (%s)", type(exc).__name__)
             message = str(exc) if isinstance(exc, AIError) else "AI assistance is temporarily unavailable. Please try again."
             status = html.Span(message + " The form was reset.", className="rfq-ai-error")
-        if alert_level:
-            log_rfq_form_event(rfq_alert_text(status), source="ai_fill", form_type=asset_class,
-                               current_user=current_user, level=alert_level,
-                               ai_log_id=alert_log_id, context=alert_context, alert_type=alert_type)
-        result = {"fields": fields, "metadata": metadata, "review": review, "request_id": uuid4().hex}
+        if alert_type and metadata.get("log_id"):
+            try:
+                AIRequestLog(DATABASE_PATH).mark_invalid(
+                    metadata["log_id"], error_type=alert_type, message=rfq_alert_text(status),
+                )
+            except sqlite3.Error:
+                logger.error("Unable to update AI request validation status.")
+        result = {"trades" if asset_class in MULTI_TRADE_ASSETS else "fields": fields,
+                  "metadata": metadata, "review": review, "request_id": uuid4().hex}
         values = [(["solve"] if fields[name] else []) if name in SOLVE_FIELDS else fields[name] for name in direct_fields]
-        choices = []
-        if asset_class == "corporate":
-            choices = [load_corporate_security_options()]
-        return values + [result, status] + choices
+        return values + [result, status]
 
 
 for _asset_class in RFQ_FIELDS:
@@ -2140,9 +2273,9 @@ def toggle_rfq_form(
 
 
 @callback(
-    Output("rfq-corp-security-text-wrap", "style"),
-    Output("rfq-corp-security-dropdown-wrap", "style"),
-    Input("rfq-bond-type-corporate", "value"),
+    Output({"type": "rfq-corporate-security-text-wrap", "trade": MATCH}, "style"),
+    Output({"type": "rfq-corporate-security-dropdown-wrap", "trade": MATCH}, "style"),
+    Input(corporate_field_id("bond_type", MATCH), "value"),
 )
 def toggle_corporate_security_input(bond_type):
     if bond_type == "Banking Instruments":
@@ -2151,48 +2284,128 @@ def toggle_corporate_security_input(bond_type):
 
 
 @callback(
-    Output("rfq-requester-sovereign", "value"),
-    Output("rfq-requester-corporate", "value"),
     Output("rfq-requester-derivatives", "value"),
     Input("current-user", "data"),
 )
 def set_rfq_requester(current_user):
     username = (current_user or {}).get("user") or ""
-    return username, username, username
+    return username
 
 
 @callback(
     Output("rfq-sovereign-assets", "data"),
-    Output("rfq-bond-name-sovereign", "data"),
     Input("rfq-form-sovereign", "opened"),
 )
 def refresh_sovereign_assets(opened):
     assets = load_sovereign_assets() if opened else []
-    bonds, _ = sovereign_form_options(assets)
-    return assets, bonds
+    return assets
 
 
 @callback(
-    Output("rfq-maturity-sovereign", "options"),
-    Output("rfq-maturity-sovereign", "value"),
-    Input("rfq-bond-name-sovereign", "value"),
-    Input("rfq-ai-result-sovereign", "data"),
-    Input("rfq-sovereign-assets", "data"),
-    State("rfq-maturity-sovereign", "value"),
+    Output(sovereign_field_id("maturity", MATCH), "options"),
+    Output(sovereign_field_id("maturity", MATCH), "value"),
+    Input(sovereign_field_id("bond_name", MATCH), "value"),
+    State("rfq-sovereign-assets", "data"),
+    State(sovereign_field_id("maturity", MATCH), "value"),
 )
-def update_sovereign_maturity_dropdown(bond_name, ai_result, assets, current_value):
+def update_sovereign_maturity_dropdown(bond_name, assets, current_value):
     _, maturities = sovereign_form_options(assets)
     options = maturities.get(bond_name, [])
     if not options:
         return [], None
     valid_values = {item["value"] for item in options}
-    if "rfq-ai-result-sovereign.data" in ctx.triggered_prop_ids:
-        fields = (ai_result or {}).get("fields", {})
-        if "maturity" in fields and fields["maturity"] in valid_values:
-            return options, fields["maturity"]
     if current_value in valid_values:
         return options, current_value
     return options, None
+
+
+def collect_rfq_trades(field_ids, field_values):
+    """Read live controls by stable row identity, preserving the visible order."""
+    trades = {}
+    for field_id, value in zip(field_ids or [], field_values or []):
+        trade = trades.setdefault(field_id["trade"], {})
+        trade[field_id["field"]] = value
+    return trades
+
+
+@callback(
+    Output("rfq-sovereign-trades", "children"),
+    Input("rfq-sovereign-add", "n_clicks"),
+    Input({"type": "rfq-sovereign-remove", "trade": ALL}, "n_clicks"),
+    Input("rfq-form-sovereign", "opened"),
+    Input("rfq-sovereign-assets", "data"),
+    Input("rfq-ai-result-sovereign", "data"),
+    Input("rfq-ai-apply-sovereign", "n_clicks"),
+    Input("current-user", "data"),
+    State(sovereign_field_id(ALL, ALL), "id"),
+    State(sovereign_field_id(ALL, ALL), "value"),
+    prevent_initial_call=True,
+)
+def manage_sovereign_trades(_add, _remove, opened, assets, ai_result, _apply, current_user, field_ids, field_values):
+    return manage_rfq_trade_blocks("sovereign", _add, _remove, opened, assets, ai_result, _apply,
+                                   current_user, field_ids, field_values)
+
+
+@callback(
+    Output("rfq-corporate-options", "data"),
+    Input("rfq-form-corporate", "opened"),
+)
+def refresh_corporate_options(opened):
+    return load_corporate_security_options() if opened else []
+
+
+@callback(
+    Output("rfq-corporate-trades", "children"),
+    Input("rfq-corporate-add", "n_clicks"),
+    Input({"type": "rfq-corporate-remove", "trade": ALL}, "n_clicks"),
+    Input("rfq-form-corporate", "opened"),
+    Input("rfq-corporate-options", "data"),
+    Input("rfq-ai-result-corporate", "data"),
+    Input("rfq-ai-apply-corporate", "n_clicks"),
+    Input("current-user", "data"),
+    State(corporate_field_id(ALL, ALL), "id"),
+    State(corporate_field_id(ALL, ALL), "value"),
+    prevent_initial_call=True,
+)
+def manage_corporate_trades(_add, _remove, opened, options, ai_result, _apply, current_user, field_ids, field_values):
+    return manage_rfq_trade_blocks("corporate", _add, _remove, opened, options, ai_result, _apply,
+                                   current_user, field_ids, field_values)
+
+
+def manage_rfq_trade_blocks(asset_class, _add, _remove, opened, assets, ai_result, _apply,
+                            current_user, field_ids, field_values):
+    builder = sovereign_trade_block if asset_class == "sovereign" else corporate_trade_block
+    trigger = ctx.triggered_id
+    # Apply also changes the result store downstream. Dash can batch both events,
+    # with Apply (or a newly mounted remove button) first in triggered_id.
+    # Always render the new result instead of resetting or ignoring that batch.
+    if f"rfq-ai-result-{asset_class}.data" in ctx.triggered_prop_ids:
+        trigger = f"rfq-ai-result-{asset_class}"
+    if trigger is None:
+        raise PreventUpdate
+    if isinstance(trigger, dict):
+        # Newly mounted remove buttons also trigger ALL. Only genuine clicks remove a row.
+        clicked = any(_remove or [])
+        if not clicked or not isinstance(trigger.get("trade"), str):
+            raise PreventUpdate
+    if not opened:
+        return [builder(uuid4().hex)]
+    username = (current_user or {}).get("user") or ""
+    if trigger == f"rfq-ai-result-{asset_class}":
+        trades = {uuid4().hex: fields for fields in (ai_result or {}).get("trades", [])}
+    elif trigger == f"rfq-{asset_class}-add" or isinstance(trigger, dict):
+        trades = collect_rfq_trades(field_ids, field_values)
+        if isinstance(trigger, dict):
+            trades.pop(trigger["trade"], None)
+        else:
+            trades[uuid4().hex] = {}
+    else:
+        # Opening, applying AI, and a fresh catalog always start with a blank trade.
+        trades = {}
+    if not trades:
+        trades = {uuid4().hex: {}}
+    return [builder(trade_id, fields, assets, username, number)
+            for number, (trade_id, fields) in enumerate(trades.items(), 1)]
 
 
 @callback(
@@ -2230,26 +2443,110 @@ def switch_rfq_tab(active_tab, _refresh, show_active):
     return rows, [html.Span("+", className="rfq-create-icon"), html.Span(label)], columns
 
 
+def rfq_batch_errors(asset_class, errors):
+    notifications = []
+    for message in errors:
+        notifications.append({
+            "id": f"rfq-submit-error-{uuid4().hex}", "action": "show",
+            "title": f"{asset_class.title()} RFQ Error", "message": message, "color": "red",
+            "autoClose": 7000, "withCloseButton": True, "position": "top-right",
+        })
+    return no_update, notifications
+
+
+def submit_sovereign_batch(field_ids, field_values, assets, current_user, refresh_value):
+    return submit_fixed_income_batch("sovereign", field_ids, field_values, assets, current_user, refresh_value)
+
+
+def submit_fixed_income_batch(asset_class, field_ids, field_values, assets, current_user, refresh_value):
+    """Validate every live block before inserting the entire batch atomically."""
+    username = (current_user or {}).get("user") or ""
+    if not username:
+        return rfq_batch_errors(asset_class, ["Sign in before creating RFQs."])
+    trades = collect_rfq_trades(field_ids, field_values)
+    if not trades:
+        return rfq_batch_errors(asset_class, ["Add at least one trade before creating RFQs."])
+    if assets is None:
+        assets = load_sovereign_assets() if asset_class == "sovereign" else load_corporate_security_options()
+    contract = rfq_json_contract(asset_class, username, **{
+        "sovereign_assets" if asset_class == "sovereign" else "corporate_options": assets,
+    })
+    specs = rfq_field_schema(contract)
+    securities = {asset["security"]: asset for asset in assets} if asset_class == "sovereign" else {}
+    maturity_cache = {}
+    errors, records = [], []
+    dt_input = datetime.now().isoformat(timespec="minutes")
+    for number, fields in enumerate(trades.values(), 1):
+        fields = dict(fields)
+        if asset_class == "corporate":
+            inactive = "security" if fields.get("bond_type") == "Banking Instruments" else "security_text"
+            fields[inactive] = None
+        messages = [f"Please fill {FIELD_LABELS[name]}." for name in rfq_missing_fields(asset_class, fields)]
+        for name, spec in specs.items():
+            if name == "requester":
+                continue
+            value = fields.get(name)
+            if value in (None, ""):
+                continue
+            if "enum" in spec and value not in spec["enum"]:
+                messages.append(f"Select a valid {FIELD_LABELS[name]}.")
+            kind = contract["field_definitions"][name]["type"]
+            if kind in ("integer", "number"):
+                parsed = _parse_quantity(value) if kind == "integer" else _parse_number(value)
+                if parsed is None or parsed <= 0:
+                    messages.append(f"Enter a positive {'whole number' if kind == 'integer' else 'number'} for {FIELD_LABELS[name]}.")
+        if asset_class == "sovereign":
+            security = securities.get(fields.get("maturity"))
+            if security and security["asset_class"] != fields.get("bond_name"):
+                messages.append("Select a maturity belonging to this bond type.")
+            security_name = fields.get("maturity")
+            maturity = security["maturity"] if security else None
+        elif fields.get("bond_type") == "Banking Instruments":
+            security_name = str(fields.get("security_text") or "").strip()
+            maturity = None
+            if not security_name and "security_text" not in rfq_missing_fields(asset_class, fields):
+                messages.append("Please fill banking instrument description.")
+        else:
+            security_name = fields.get("security")
+            if security_name and security_name in specs["security"]["enum"]:
+                if security_name not in maturity_cache:
+                    maturity_cache[security_name] = load_security_maturity(security_name)
+                maturity = maturity_cache[security_name]
+            else:
+                maturity = None
+        for message in dict.fromkeys(messages):
+            errors.append(f"Trade {number}: {message}")
+        records.append((
+            dt_input, username, username, "Sovereign Bond" if asset_class == "sovereign" else "Corporate Bond", fields.get("direction"),
+            FIXED_INCOME_QUOTE_TYPE, security_name, maturity,
+            _parse_quantity(fields.get("quantity")), _parse_number(fields.get("volume")),
+            _parse_number(fields.get("yield_limit")), None, 1,
+        ))
+    if errors:
+        return rfq_batch_errors(asset_class, errors)
+    try:
+        with closing(sqlite3.connect(DATABASE_PATH)) as conn, conn:
+            conn.executemany('''INSERT INTO RFQ (
+                DT_INPUT, USR_INPUT, REQUESTER, CLASS, DIRECTION, TYPE, SEC_NAME,
+                DT_MATURITY, QTY, VOLUME, "LIMIT", STR_RESPONSE, FL_ACTIVE
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', records)
+    except sqlite3.Error:
+        return rfq_batch_errors(asset_class, ["Unable to create RFQs. No trades were saved. Try again."])
+    return (refresh_value or 0) + 1, no_update
+
+
 @callback(
     Output("rfq-refresh", "data", allow_duplicate=True),
     Output("rfq-notification-container", "sendNotifications", allow_duplicate=True),
     Input("rfq-submit-sovereign", "n_clicks"),
     Input("rfq-submit-corporate", "n_clicks"),
     Input("rfq-submit-derivatives", "n_clicks"),
-    State("rfq-direction-sovereign", "value"),
-    State("rfq-bond-name-sovereign", "value"),
-    State("rfq-maturity-sovereign", "value"),
-    State("rfq-qty-sovereign", "value"),
-    State("rfq-volume-sovereign", "value"),
-    State("rfq-limit-sovereign", "value"),
+    State(sovereign_field_id(ALL, ALL), "id"),
+    State(sovereign_field_id(ALL, ALL), "value"),
     State("rfq-sovereign-assets", "data"),
-    State("rfq-direction-corporate", "value"),
-    State("rfq-bond-type-corporate", "value"),
-    State("rfq-corp-security-text", "value"),
-    State("rfq-corp-security-dropdown", "value"),
-    State("rfq-qty-corporate", "value"),
-    State("rfq-volume-corporate", "value"),
-    State("rfq-limit-corporate", "value"),
+    State(corporate_field_id(ALL, ALL), "id"),
+    State(corporate_field_id(ALL, ALL), "value"),
+    State("rfq-corporate-options", "data"),
     State("rfq-direction-derivatives", "value"),
     State("rfq-quote-type-derivatives", "value"),
     State("rfq-bond-name-derivatives", "value"),
@@ -2272,20 +2569,12 @@ def submit_rfq(
     sovereign_clicks,
     corporate_clicks,
     derivatives_clicks,
-    direction_sovereign,
-    bond_name_sovereign,
-    maturity_sovereign,
-    qty_sovereign,
-    volume_sovereign,
-    limit_sovereign,
+    sovereign_field_ids,
+    sovereign_field_values,
     sovereign_assets,
-    direction_corporate,
-    bond_type_corporate,
-    corp_security_text,
-    corp_security_dropdown,
-    qty_corporate,
-    volume_corporate,
-    limit_corporate,
+    corporate_field_ids,
+    corporate_field_values,
+    corporate_options,
     direction_derivatives,
     quote_type_derivatives,
     bond_name_derivatives,
@@ -2307,29 +2596,11 @@ def submit_rfq(
         raise PreventUpdate
 
     if ctx.triggered_id == "rfq-submit-sovereign":
-        asset_class = "Sovereign Bond"
-        direction = direction_sovereign
-        quote_type = FIXED_INCOME_QUOTE_TYPE
-        bond_name = maturity_sovereign
-        sovereign_assets = load_sovereign_assets() if sovereign_assets is None else sovereign_assets
-        maturity = next((asset["maturity"] for asset in sovereign_assets
-                         if asset["security"] == maturity_sovereign), None)
-        qty = qty_sovereign
-        volume = volume_sovereign
-        limit_value = limit_sovereign
+        return submit_sovereign_batch(sovereign_field_ids, sovereign_field_values, sovereign_assets,
+                                      current_user, refresh_value)
     elif ctx.triggered_id == "rfq-submit-corporate":
-        asset_class = "Corporate Bond"
-        direction = direction_corporate
-        quote_type = FIXED_INCOME_QUOTE_TYPE
-        if bond_type_corporate == "Banking Instruments":
-            bond_name = corp_security_text
-            maturity = None
-        else:
-            bond_name = corp_security_dropdown
-            maturity = load_security_maturity(corp_security_dropdown)
-        qty = qty_corporate
-        volume = volume_corporate
-        limit_value = limit_corporate
+        return submit_fixed_income_batch("corporate", corporate_field_ids, corporate_field_values, corporate_options,
+                                         current_user, refresh_value)
     elif ctx.triggered_id == "rfq-submit-derivatives":
         asset_class = "Derivatives"
         direction = direction_derivatives
@@ -2367,23 +2638,18 @@ def submit_rfq(
         "direction": direction, "quote_type": quote_type,
         "quantity": qty_text or None, "volume": volume_text or None, "yield_limit": limit_value,
     }
-    if form_class == "sovereign":
-        form_values.update(bond_name=bond_name_sovereign, maturity=maturity_sovereign)
-    elif form_class == "corporate":
-        form_values.update(bond_type=bond_type_corporate, security=corp_security_dropdown, security_text=corp_security_text)
-    else:
-        form_values.update(
-            security=bond_name_derivatives, maturity=maturity_derivatives,
-            maturity_unit=maturity_unit_derivatives, premium=limit_derivatives,
-            strategy=strategy_derivatives, strike=strike_derivatives,
-            strike_solve="solve" in (strike_solve_derivatives or []),
-            barrier=barrier_derivatives, barrier_solve="solve" in (barrier_solve_derivatives or []),
-            barrier_type=barrier_type_derivatives,
-        )
+    form_values.update(
+        security=bond_name_derivatives, maturity=maturity_derivatives,
+        maturity_unit=maturity_unit_derivatives, premium=limit_derivatives,
+        strategy=strategy_derivatives, strike=strike_derivatives,
+        strike_solve="solve" in (strike_solve_derivatives or []),
+        barrier=barrier_derivatives, barrier_solve="solve" in (barrier_solve_derivatives or []),
+        barrier_type=barrier_type_derivatives,
+    )
     for field in rfq_missing_fields(form_class, form_values):
         validation_errors.append(f"Please fill {FIELD_LABELS[field]}.")
     contract = rfq_json_contract(form_class, requester, sovereign_assets=sovereign_assets)
-    for field, spec in contract["output_schema"]["properties"]["fields"]["properties"].items():
+    for field, spec in rfq_field_schema(contract).items():
         value = form_values.get(field)
         if field != "requester" and value not in (None, "") and "enum" in spec and value not in spec["enum"]:
             validation_errors.append(f"Select a valid {FIELD_LABELS[field]}.")
@@ -2408,9 +2674,6 @@ def submit_rfq(
             )
 
     if validation_errors:
-        for message in validation_errors:
-            log_rfq_form_event(message, source="submit_rfq", form_type=form_class,
-                               current_user=current_user, context={"fields": form_values})
         notification_prefix = datetime.now().strftime("%Y%m%d%H%M%S%f")
         notifications = [
             {
@@ -2471,9 +2734,7 @@ def submit_rfq(
                 ),
             )
             conn.commit()
-    except sqlite3.Error as exc:
-        log_rfq_form_event("Unable to create RFQ. Try again.", source="submit_rfq", form_type=form_class,
-                           current_user=current_user, context={"error_type": type(exc).__name__})
+    except sqlite3.Error:
         return (
             no_update,
             [
@@ -2499,11 +2760,10 @@ def submit_rfq(
     Output("rfq-error-notification", "action"),
     Input("rfq-grid", "cellValueChanged"),
     State("rfq-active-switch", "checked"),
-    State("current-user", "data"),
     State("rfq-refresh", "data"),
     prevent_initial_call=True,
 )
-def append_broker_response(event, show_active, current_user, refresh_value):
+def append_broker_response(event, show_active, refresh_value):
     if not event:
         raise PreventUpdate
     if not show_active:
@@ -2526,18 +2786,15 @@ def append_broker_response(event, show_active, current_user, refresh_value):
     new_value = event.get("newValue", event.get("value"))
 
     broker_name = broker_map[col_id]
-    form_type = None
 
     try:
         with closing(sqlite3.connect(DATABASE_PATH, timeout=30)) as conn, conn:
             conn.row_factory = sqlite3.Row
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                'SELECT STR_RESPONSE, CLASS FROM RFQ WHERE RFQ_ID = ?',
+                'SELECT STR_RESPONSE FROM RFQ WHERE RFQ_ID = ?',
                 (rfq_id,),
             ).fetchone()
-            if row:
-                form_type = {"Sovereign Bond": "sovereign", "Corporate Bond": "corporate", "Derivatives": "derivatives"}.get(row["CLASS"])
             existing, responses_changed = _normalize_response_entries(
                 _parse_response(row["STR_RESPONSE"] if row else None)
             )
@@ -2603,15 +2860,9 @@ def append_broker_response(event, show_active, current_user, refresh_value):
             conn.commit()
     except RFQQuoteValidationError as exc:
         message = str(exc)
-        log_rfq_form_event(message, source="broker_response", form_type=form_type,
-                           current_user=current_user, rfq_id=rfq_id,
-                           context={"broker": broker_name, "value": new_value})
         return (refresh_value or 0) + 1, message, "show"
-    except sqlite3.Error as exc:
+    except sqlite3.Error:
         message = "Unable to update quote. Try again."
-        log_rfq_form_event(message, source="broker_response", form_type=form_type,
-                           current_user=current_user, rfq_id=rfq_id,
-                           context={"error_type": type(exc).__name__, "broker": broker_name})
         return (refresh_value or 0) + 1, message, "show"
 
     return (refresh_value or 0) + 1, no_update, "hide"
@@ -2663,10 +2914,7 @@ def handle_rfq_action(
                     (usr_closed, dt_closed, rfq_id),
                 )
                 conn.commit()
-        except sqlite3.Error as exc:
-            log_rfq_form_event("Unable to close RFQ. Try again.", source="rfq_action",
-                               current_user=current_user, rfq_id=rfq_id,
-                               context={"error_type": type(exc).__name__})
+        except sqlite3.Error:
             raise PreventUpdate
         return (refresh_value or 0) + 1, no_update, no_update
 

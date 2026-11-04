@@ -1,4 +1,4 @@
-"""Shared SQLite audit storage for AI attempts and form events."""
+"""Shared SQLite audit storage for AI attempts."""
 
 from contextlib import closing
 from datetime import datetime, timezone
@@ -107,51 +107,14 @@ class AIRequestLog:
             )
 
 
-class FormEventLog:
-    def __init__(self, database_path):
-        self.database_path = Path(database_path)
-
-    def ensure_schema(self):
+    def mark_invalid(self, log_id, *, error_type, message):
+        """Record a completed model response rejected during form validation."""
         with closing(sqlite3.connect(self.database_path, timeout=30)) as conn, conn:
-            conn.executescript("""
-                CREATE TABLE IF NOT EXISTS FORM_EVENT_LOG (
-                    EVENT_ID INTEGER PRIMARY KEY AUTOINCREMENT,
-                    FEATURE TEXT NOT NULL,
-                    FORM_TYPE TEXT,
-                    USERNAME TEXT NOT NULL,
-                    DT_EVENT TEXT NOT NULL,
-                    LEVEL TEXT NOT NULL CHECK (LEVEL IN ('error', 'warning', 'info')),
-                    SOURCE TEXT NOT NULL,
-                    MESSAGE TEXT NOT NULL,
-                    AI_LOG_ID INTEGER,
-                    RFQ_ID INTEGER,
-                    CONTEXT_JSON TEXT
-                );
-                CREATE INDEX IF NOT EXISTS idx_form_event_log_feature_time
-                ON FORM_EVENT_LOG (FEATURE, DT_EVENT DESC);
-            """)
-
-    def record(self, *, feature, form_type, username, level, source, message,
-               ai_log_id=None, rfq_id=None, context=None, alert_type=None):
-        with closing(sqlite3.connect(self.database_path, timeout=30)) as conn, conn:
-            row = conn.execute(
-                """INSERT INTO FORM_EVENT_LOG (
-                       FEATURE, FORM_TYPE, USERNAME, DT_EVENT, LEVEL, SOURCE,
-                       MESSAGE, AI_LOG_ID, RFQ_ID, CONTEXT_JSON
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (feature, form_type, username or "", datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-                 level, source, message, ai_log_id, rfq_id,
-                 json.dumps(context, ensure_ascii=False, default=str) if context is not None else None),
+            conn.execute(
+                """UPDATE AI_REQUEST_LOG
+                   SET STATUS = 'invalid_response',
+                       ERROR_TYPE = COALESCE(NULLIF(ERROR_TYPE, ''), ?),
+                       ERROR_MESSAGE = COALESCE(NULLIF(ERROR_MESSAGE, ''), ?)
+                   WHERE LOG_ID = ? AND STATUS = 'completed'""",
+                (error_type, message, log_id),
             )
-            if ai_log_id is not None and level in ("error", "warning"):
-                # Keep the form event and the request's validation outcome atomic.
-                # Preserve an existing transport error when one was already recorded.
-                conn.execute(
-                    """UPDATE AI_REQUEST_LOG
-                       SET ERROR_TYPE = COALESCE(NULLIF(ERROR_TYPE, ''), ?, ?),
-                           ERROR_MESSAGE = COALESCE(NULLIF(ERROR_MESSAGE, ''), ?),
-                           STATUS = CASE WHEN STATUS = 'completed' THEN 'invalid_response' ELSE STATUS END
-                       WHERE LOG_ID = ?""",
-                    (alert_type, "FormWarning" if level == "warning" else "FormError", message, ai_log_id),
-                )
-            return row.lastrowid
