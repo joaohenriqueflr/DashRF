@@ -1,5 +1,6 @@
 import secrets
 import sqlite3
+from contextlib import closing
 from datetime import date
 from pathlib import Path
 
@@ -24,10 +25,16 @@ def _derive_email(user_name):
 
 
 def ensure_user_keys_table():
-    with sqlite3.connect(DATABASE_PATH) as conn:
+    with closing(sqlite3.connect(DATABASE_PATH)) as conn, conn:
+        legacy_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'RFQ_USER_KEYS'"
+        ).fetchone()
+        if legacy_table:
+            conn.execute("ALTER TABLE RFQ_USER_KEYS RENAME TO USER_KEYS")
+        conn.execute("DROP INDEX IF EXISTS idx_rfq_user_keys_secret")
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS RFQ_USER_KEYS (
+            CREATE TABLE IF NOT EXISTS USER_KEYS (
                 KEY_ID INTEGER PRIMARY KEY AUTOINCREMENT,
                 SECRET_KEY TEXT UNIQUE,
                 USR_NAME TEXT,
@@ -38,23 +45,23 @@ def ensure_user_keys_table():
             )
             """
         )
-        columns = [row[1] for row in conn.execute("PRAGMA table_info(RFQ_USER_KEYS)")]
+        columns = [row[1] for row in conn.execute("PRAGMA table_info(USER_KEYS)")]
         if "EMAIL" not in columns:
-            conn.execute("ALTER TABLE RFQ_USER_KEYS ADD COLUMN EMAIL TEXT")
+            conn.execute("ALTER TABLE USER_KEYS ADD COLUMN EMAIL TEXT")
         conn.execute(
             """
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_rfq_user_keys_secret
-            ON RFQ_USER_KEYS (SECRET_KEY)
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_user_keys_secret
+            ON USER_KEYS (SECRET_KEY)
             """
         )
         master_count = conn.execute(
-            "SELECT COUNT(*) FROM RFQ_USER_KEYS WHERE ROLE = 'master' AND FL_ACTIVE = 1"
+            "SELECT COUNT(*) FROM USER_KEYS WHERE ROLE = 'master' AND FL_ACTIVE = 1"
         ).fetchone()[0]
         if master_count == 0:
             master_key = secrets.token_urlsafe(12)
             conn.execute(
                 """
-                INSERT INTO RFQ_USER_KEYS (
+                INSERT INTO USER_KEYS (
                     SECRET_KEY,
                     USR_NAME,
                     EMAIL,
@@ -78,13 +85,13 @@ def ensure_user_keys_table():
         rows = conn.execute(
             """
             SELECT KEY_ID, USR_NAME
-            FROM RFQ_USER_KEYS
+            FROM USER_KEYS
             WHERE EMAIL IS NULL OR EMAIL = ''
             """
         ).fetchall()
         for key_id, user_name in rows:
             conn.execute(
-                "UPDATE RFQ_USER_KEYS SET EMAIL = ? WHERE KEY_ID = ?",
+                "UPDATE USER_KEYS SET EMAIL = ? WHERE KEY_ID = ?",
                 (_derive_email(user_name), key_id),
             )
         conn.commit()
@@ -200,12 +207,12 @@ def activate_key(n_clicks, secret_key):
     if not secret_key:
         return no_update, "Enter a secret key to activate.", no_update
     try:
-        with sqlite3.connect(DATABASE_PATH) as conn:
+        with closing(sqlite3.connect(DATABASE_PATH)) as conn, conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
                 """
                 SELECT KEY_ID, USR_NAME, EMAIL, ROLE
-                FROM RFQ_USER_KEYS
+                FROM USER_KEYS
                 WHERE SECRET_KEY = ? AND FL_ACTIVE = 1
                 """,
                 (secret_key.strip(),),
@@ -243,11 +250,11 @@ def load_keys_grid(_refresh, current_user):
     if not current_user or current_user.get("role") != "master":
         return []
     try:
-        with sqlite3.connect(DATABASE_PATH) as conn:
+        with closing(sqlite3.connect(DATABASE_PATH)) as conn, conn:
             rows = conn.execute(
                 """
                 SELECT USR_NAME, EMAIL, ROLE, SECRET_KEY, FL_ACTIVE, DT_CREATED
-                FROM RFQ_USER_KEYS
+                FROM USER_KEYS
                 ORDER BY DT_CREATED DESC
                 """
             ).fetchall()
@@ -285,10 +292,10 @@ def create_key(n_clicks, user_name, role, current_user, refresh_value):
     new_key = secrets.token_urlsafe(10)
     email = _derive_email(user_name)
     try:
-        with sqlite3.connect(DATABASE_PATH) as conn:
+        with closing(sqlite3.connect(DATABASE_PATH)) as conn, conn:
             conn.execute(
                 """
-                INSERT INTO RFQ_USER_KEYS (
+                INSERT INTO USER_KEYS (
                     SECRET_KEY,
                     USR_NAME,
                     EMAIL,

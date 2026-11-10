@@ -1,6 +1,6 @@
 import re
 
-from dash import Dash, Input, Output, callback, dcc, html, no_update
+from dash import Dash, Input, Output, State, callback, ctx, dcc, html
 import dash
 import dash_bootstrap_components as dbc
 import dash_mantine_components as dmc
@@ -37,8 +37,33 @@ app.index_string = """
 </html>
 """
 
-top_nav = html.Div(
+def nav_group(label, slug, links):
+    return html.Div(
+        className="nav-group",
+        children=[
+            html.Button(
+                [label, html.Span(className="nav-chevron", **{"aria-hidden": "true"})],
+                id=f"nav-{slug}-trigger",
+                className="nav-tab nav-group-trigger",
+                type="button",
+                **{"aria-expanded": "false", "aria-controls": f"nav-{slug}-submenu"},
+            ),
+            html.Div(
+                [
+                    dbc.NavLink(name, href=href, active="exact", className="nav-tab nav-submenu-link")
+                    for name, href in links
+                ],
+                id=f"nav-{slug}-submenu",
+                className="nav-submenu",
+                **{"aria-labelledby": f"nav-{slug}-trigger"},
+            ),
+        ],
+    )
+
+
+top_nav = html.Nav(
     className="top-nav",
+    **{"aria-label": "Main navigation"},
     children=[
         html.Div(
             className="nav-brand",
@@ -49,42 +74,19 @@ top_nav = html.Div(
         dbc.Nav(
             className="nav-tabs",
             children=[
-                dbc.NavLink(
-                    "Fixed Income Monitor",
-                    href="/",
-                    active="exact",
-                    className="nav-tab",
+                nav_group(
+                    "Fixed Income",
+                    "fixed-income",
+                    [("Monitor", "/"), ("Portfolio", "/portfolio"), ("Screener", "/FI-Screener")],
                 ),
                 dbc.NavLink(
-                    "Fixed Income Portfolio",
-                    href="/portfolio",
-                    active="exact",
-                    className="nav-tab",
-                ),
-                dbc.NavLink(
-                    "Fixed Income Screener",
-                    href="/FI-Screener",
-                    active="exact",
-                    className="nav-tab",
-                ),
-                dbc.NavLink(
-                    "UGM Request for Quote",
+                    "Request for Quote",
                     href="/rfq",
                     active="exact",
                     className="nav-tab",
                 ),
-                dbc.NavLink(
-                    "FX Trading",
-                    href="/fx-trading",
-                    active="exact",
-                    className="nav-tab",
-                ),
-                dbc.NavLink(
-                    "UGM Access",
-                    href="/keys",
-                    active="exact",
-                    className="nav-tab",
-                ),
+                nav_group("FX", "fx", [("Trading", "/fx-trading")]),
+                nav_group("UGM", "ugm", [("Routines", "/routines"), ("AI Maintenance", "/ai-maintenance"), ("Access", "/keys")]),
             ],
         ),
         html.Div(className="nav-spacer"),
@@ -100,14 +102,17 @@ app.layout = dmc.MantineProvider(
                 top_nav,
                 html.Div(
                     id="user-fab",
-                    className="user-fab user-fab-hidden",
+                    className="user-fab user-fab-guest",
                     children=[
                         html.Div(
                             className="user-fab-bubble",
                             children=[
-                                html.Div(
+                                html.Button(
+                                    "--",
                                     id="user-fab-initials",
                                     className="user-fab-initials",
+                                    type="button",
+                                    **{"aria-label": "User account"},
                                 ),
                                 html.Div(
                                     className="user-fab-card",
@@ -119,6 +124,7 @@ app.layout = dmc.MantineProvider(
                                                     className="user-fab-avatar",
                                                     children=[
                                                         html.Div(
+                                                            "--",
                                                             id="user-fab-avatar-initials",
                                                             className="user-fab-avatar-initials",
                                                         ),
@@ -128,10 +134,12 @@ app.layout = dmc.MantineProvider(
                                                     className="user-fab-header-text",
                                                     children=[
                                                         html.Div(
+                                                            "Log in",
                                                             id="user-fab-name",
                                                             className="user-fab-name",
                                                         ),
                                                         html.Div(
+                                                            "Enter your secret key to continue.",
                                                             id="user-fab-email",
                                                             className="user-fab-email",
                                                         ),
@@ -143,7 +151,36 @@ app.layout = dmc.MantineProvider(
                                             className="user-fab-body",
                                             children=[
                                                 html.Div(
-                                                    className="user-fab-profile",
+                                                    className="user-fab-login",
+                                                    children=[
+                                                        html.Label(
+                                                            "Secret key",
+                                                            htmlFor="user-login-key",
+                                                            className="user-fab-profile-label",
+                                                        ),
+                                                        dcc.Input(
+                                                            id="user-login-key",
+                                                            type="password",
+                                                            placeholder="Paste your secret key",
+                                                            className="user-fab-key-input",
+                                                            autoComplete="off",
+                                                        ),
+                                                        html.Button(
+                                                            "Log in",
+                                                            id="user-login",
+                                                            className="user-fab-login-button",
+                                                            type="button",
+                                                        ),
+                                                        html.Div(
+                                                            id="user-login-status",
+                                                            className="user-fab-login-status",
+                                                            role="status",
+                                                            **{"aria-live": "polite"},
+                                                        ),
+                                                    ],
+                                                ),
+                                                html.Div(
+                                                    className="user-fab-profile user-fab-session",
                                                     children=[
                                                         html.Div(
                                                             "Access Profile",
@@ -158,7 +195,7 @@ app.layout = dmc.MantineProvider(
                                                 html.Button(
                                                     "Logout",
                                                     id="user-logout",
-                                                    className="user-fab-logout",
+                                                    className="user-fab-logout user-fab-session",
                                                     type="button",
                                                 ),
                                             ],
@@ -187,7 +224,7 @@ app.layout = dmc.MantineProvider(
 )
 def update_user_fab(current_user):
     if not current_user or not current_user.get("user"):
-        return "--", "--", "No active user", "", "", "user-fab user-fab-hidden"
+        return "--", "--", "Log in", "Enter your secret key to continue.", "", "user-fab user-fab-guest"
     user_name = current_user["user"]
     initials = "".join([part[0] for part in user_name.split() if part]).upper()
     initials = initials[:2] if initials else "--"
@@ -205,10 +242,23 @@ def update_user_fab(current_user):
 
 @callback(
     Output("current-user", "data", allow_duplicate=True),
+    Output("user-login-status", "children"),
+    Output("user-login-key", "value"),
+    Input("user-login", "n_clicks"),
+    Input("user-login-key", "n_submit"),
     Input("user-logout", "n_clicks"),
+    State("user-login-key", "value"),
     prevent_initial_call=True,
 )
-def logout_user(_clicks):
-    return None
+def update_user_session(login_clicks, login_submits, logout_clicks, secret_key):
+    if ctx.triggered_id == "user-logout":
+        return None, "", ""
+
+    # Reuse the Access page's active-key validation and session format.
+    from pages.user_keys import activate_key
+
+    return activate_key(login_clicks or login_submits, secret_key)
+
+
 if __name__ == "__main__":
     app.run(debug=True)

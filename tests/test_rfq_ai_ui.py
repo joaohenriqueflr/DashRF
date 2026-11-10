@@ -14,7 +14,6 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from services.openai_client import StructuredResult
 from services.prompts import PromptStore
 
 HAS_DASH = all(importlib.util.find_spec(name) for name in (
@@ -104,6 +103,23 @@ class RFQAITests(unittest.TestCase):
             conn.execute("DELETE FROM RFQ")
             conn.execute("DELETE FROM AI_REQUEST_LOG")
 
+    def test_schema_removes_legacy_requesters_and_preserves_rfq_history(self):
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            self.assertIsNone(conn.execute(
+                "SELECT name FROM sqlite_master WHERE name = 'RFQ_REQUESTERS'"
+            ).fetchone())
+            conn.execute("CREATE TABLE RFQ_REQUESTERS (NM_REQUESTER TEXT)")
+            conn.execute("INSERT INTO RFQ_REQUESTERS VALUES ('Legacy User')")
+            conn.execute("INSERT INTO RFQ (REQUESTER, USR_INPUT) VALUES ('Legacy User', 'Legacy User')")
+        self.page.ensure_rfq_schema()
+        self.page.ensure_rfq_schema()
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertIsNone(conn.execute(
+                "SELECT name FROM sqlite_master WHERE name = 'RFQ_REQUESTERS'"
+            ).fetchone())
+            self.assertEqual(conn.execute("SELECT REQUESTER, USR_INPUT FROM RFQ").fetchall(),
+                             [('Legacy User', 'Legacy User')])
+
     def ai_dispatch(self, asset_class, patch_values, *, relevant=True, count=1, conflicts=False, unresolved=None,
                     text="Fill one complete test RFQ", usage=None, trades=None):
         fields = self.page.rfq_empty_form(asset_class, "AI Test User")
@@ -123,17 +139,35 @@ class RFQAITests(unittest.TestCase):
             ]
             if trades is not None:
                 data["request_count"] = len(trades)
-        result = StructuredResult(data, "test-model", "test-response", 1, 1, **(usage or {}))
         values = {
             f"rfq-ai-apply-{asset_class}.n_clicks": 1,
             f"rfq-ai-text-{asset_class}.value": text,
             f"rfq-form-{asset_class}.opened": True,
             "current-user.data": {"user": "AI Test User"},
         }
-        self.service = Mock()
-        self.service.extract.return_value = result
+        self.service, self.sdk_client = self.sdk_service(data, usage=usage)
         with patch.object(self.page, "OpenAIService", return_value=self.service):
             return self.dispatch(f"rfq-ai-status-{asset_class}.children", values, [f"rfq-ai-apply-{asset_class}.n_clicks"])
+
+    def sdk_service(self, data, *, raw=None, usage=None):
+        """Exercise real transport/audit while replacing only the SDK network call."""
+        client = Mock()
+        client.responses.create.return_value = SimpleNamespace(
+            status="completed", output=[], output_text=raw if raw is not None else json.dumps(data),
+            model="test-model", id="test-response", usage=usage,
+        )
+        service = self.page.OpenAIService(client=client, database_path=self.db)
+        extract = service.extract
+        watched = Mock()
+
+        def call(**kwargs):
+            result = extract(**kwargs)
+            watched.return_value = result
+            return result
+
+        watched.side_effect = call
+        service.extract = watched
+        return service, client
 
     @staticmethod
     def pattern_key(component_id, prop):
@@ -461,7 +495,7 @@ class RFQAITests(unittest.TestCase):
             status="completed", output=[], output_text=output, model="returned-model", id="test-id",
             usage=SimpleNamespace(input_tokens=2400, output_tokens=180, total_tokens=2580),
         )
-        service = self.page.OpenAIService(client=client)
+        service = self.page.OpenAIService(client=client, database_path=self.db)
         self.page.extract_rfq("corporate", "Comprar 500k TEST11", "Test User", service=service)
         row = self.audit_rows()[0]
         snapshot = json.loads(row["FULL_PROMPT"])
@@ -612,15 +646,18 @@ class RFQAITests(unittest.TestCase):
         self.assertEqual((request["INPUT_TOKENS"], request["OUTPUT_TOKENS"], request["TOTAL_TOKENS"]), (1890, 420, 2310))
 
     def test_attempt_is_committed_before_model_call_and_transport_failure_logged(self):
-        service = Mock()
+        service, client = self.sdk_service({})
+
+        class APITimeoutError(TimeoutError):
+            pass
 
         def fail_request(**kwargs):
             row = self.audit_rows()[0]
             self.assertEqual(row["STATUS"], "running")
             self.assertIsNone(row["DT_FINISHED"])
-            raise self.page.AIError("The AI service could not complete the request.", error_type="APITimeoutError")
+            raise APITimeoutError("Sensitive transport detail")
 
-        service.extract.side_effect = fail_request
+        client.responses.create.side_effect = fail_request
         with self.assertRaises(self.page.AIError):
             self.page.extract_rfq("sovereign", "Buy LTN", "Test User", service=service)
         row = self.audit_rows()[0]
@@ -638,7 +675,7 @@ class RFQAITests(unittest.TestCase):
             model="returned-model", id="broken-response",
             usage=SimpleNamespace(input_tokens=500, output_tokens=90, total_tokens=590),
         )
-        service = self.page.OpenAIService(client=client)
+        service = self.page.OpenAIService(client=client, database_path=self.db)
         with self.assertRaises(self.page.AIError):
             self.page.extract_rfq("corporate", "Buy TEST11", "Test User", service=service)
         row = self.audit_rows()[0]
@@ -655,19 +692,16 @@ class RFQAITests(unittest.TestCase):
             usage=SimpleNamespace(input_tokens=321, output_tokens=4000, total_tokens=4321),
         )
         with self.assertRaises(self.page.AIError):
-            self.page.extract_rfq("corporate", "Buy 500k TEST11", "Test User", service=self.page.OpenAIService(client=client))
+            self.page.extract_rfq("corporate", "Buy 500k TEST11", "Test User", service=self.page.OpenAIService(client=client, database_path=self.db))
         row = self.audit_rows()[0]
         self.assertEqual(row["STATUS"], "failed")
         self.assertEqual(row["ERROR_TYPE"], "IncompleteResponse")
         self.assertEqual((row["INPUT_TOKENS"], row["OUTPUT_TOKENS"], row["TOTAL_TOKENS"]), (321, 4000, 4321))
 
     def test_json_rejected_by_form_is_logged_before_error_is_returned(self):
-        service = Mock()
         raw = '{\n  "unexpected": true\n}'
-        service.extract.return_value = StructuredResult(
-            {"unexpected": True}, "model", "bad-schema-response", 1, 1, raw,
-            input_tokens=1100, output_tokens=95, total_tokens=1195,
-        )
+        service, _ = self.sdk_service({"unexpected": True}, raw=raw,
+                                      usage={"input_tokens": 1100, "output_tokens": 95, "total_tokens": 1195})
         with self.assertRaises(self.page.AIError):
             self.page.extract_rfq("corporate", "Buy TEST11", "Test User", service=service)
         row = self.audit_rows()[0]
@@ -676,11 +710,11 @@ class RFQAITests(unittest.TestCase):
         self.assertEqual((row["INPUT_TOKENS"], row["OUTPUT_TOKENS"], row["TOTAL_TOKENS"]), (1100, 95, 1195))
 
     def test_no_model_call_if_request_cannot_be_logged(self):
-        service = Mock()
+        service, client = self.sdk_service({})
         with patch.object(self.page.AIRequestLog, "begin", side_effect=sqlite3.OperationalError("test database unavailable")):
             with self.assertRaises(sqlite3.Error):
                 self.page.extract_rfq("sovereign", "Buy LTN", "Test User", service=service)
-        service.extract.assert_not_called()
+        client.responses.create.assert_not_called()
 
     def test_manual_maturity_change_does_not_reapply_old_ai_result(self):
         result = self.maturity_dispatch("LFT", "LTN 01/01/2028")
@@ -1040,11 +1074,10 @@ class RFQAITests(unittest.TestCase):
                 conn.execute("DROP TRIGGER test_reject_second")
 
     def test_inconsistent_batch_json_is_rejected_and_logged(self):
-        service = Mock()
-        service.extract.return_value = StructuredResult({
+        service, _ = self.sdk_service({
             "asset_class": "sovereign", "is_rfq_request": True, "request_count": 2,
             "has_conflicts": False, "trades": [],
-        }, "model", "test-response", 1, 1)
+        })
         with self.assertRaises(self.page.AIError):
             self.page.extract_rfq("sovereign", "Buy LTN and sell LFT", "Test User", service=service)
         self.assertEqual(self.audit_rows()[0]["STATUS"], "invalid_response")

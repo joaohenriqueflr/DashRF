@@ -30,7 +30,7 @@ import dash_ag_grid as dag
 import dash_bootstrap_components as dbc
 import dash_mantine_components as dmc
 
-from services.openai_client import AIConfigurationError, AIError, OpenAIService, build_structured_request
+from services.openai_client import AIConfigurationError, AIError, OpenAIService
 from services.ai_audit import AIRequestLog
 from services.prompts import PromptStore
 
@@ -460,30 +460,8 @@ def ensure_rfq_schema():
                     """
                 )
 
-            if "RFQ_REQUESTERS" in tables:
-                conn.execute(
-                    """
-                    UPDATE RFQ_REQUESTERS
-                    SET NM_REQUESTER = trim(NM_REQUESTER)
-                    WHERE COALESCE(NM_REQUESTER, '') <> trim(COALESCE(NM_REQUESTER, ''))
-                    """
-                )
-                conn.execute(
-                    """
-                    DELETE FROM RFQ_REQUESTERS
-                    WHERE rowid NOT IN (
-                        SELECT MIN(rowid)
-                        FROM RFQ_REQUESTERS
-                        GROUP BY lower(trim(COALESCE(NM_REQUESTER, '')))
-                    )
-                    """
-                )
-                conn.execute(
-                    """
-                    CREATE UNIQUE INDEX IF NOT EXISTS idx_rfq_requesters_name
-                    ON RFQ_REQUESTERS (NM_REQUESTER COLLATE NOCASE)
-                    """
-                )
+            # Requesters come from the signed-in session; RFQ keeps its history.
+            conn.execute("DROP TABLE IF EXISTS RFQ_REQUESTERS")
 
             if "FIXED_INCOME_SECURITY_CLASSIFICATION" in tables:
                 conn.execute(
@@ -1057,26 +1035,24 @@ def extract_rfq(asset_class, text, username, *, service=None, sovereign_assets=N
     contract = rfq_json_contract(asset_class, username, sovereign_assets=sovereign_assets, corporate_options=corporate_options)
     prompt = PromptStore(DATABASE_PATH).get_active("rfq", f"fill_{asset_class}")
     payload = {"request_text": text.strip(), "requester_username": username, "form_contract": contract}
-    request = build_structured_request(prompt=prompt, payload=payload,
-                                       schema=contract["output_schema"], schema_name=f"rfq_{asset_class}")
-    audit = AIRequestLog(DATABASE_PATH)
-    log_id = audit.begin(
-        feature="rfq", form_type=asset_class, username=username, text=text, prompt=prompt, full_prompt=request,
+    result = (service or OpenAIService(database_path=DATABASE_PATH)).extract(
+        prompt=prompt, schema=contract["output_schema"], schema_name=f"rfq_{asset_class}", payload=payload,
+        audit_context={"username": username, "form_type": asset_class, "text": text},
     )
-    result = None
     try:
-        result = (service or OpenAIService()).extract(
-            prompt=prompt, schema=contract["output_schema"], schema_name=f"rfq_{asset_class}",
-            payload=payload,
-        )
         fields, missing, relevant, ambiguous = interpret_rfq_json(asset_class, result.data, username, contract)
     except Exception as exc:
-        invalid_response = result is not None or getattr(exc, "error_type", None) in {"InvalidJSON", "InvalidJSONShape"}
-        audit.finish(log_id, status="invalid_response" if invalid_response else "failed", result=result, error=exc)
+        if result.log_id is not None:
+            try:
+                AIRequestLog(DATABASE_PATH).mark_invalid(
+                    result.log_id, error_type=getattr(exc, "error_type", None) or type(exc).__name__,
+                    message=str(exc) if isinstance(exc, AIError) else "The RFQ response failed validation.",
+                )
+            except sqlite3.Error:
+                logger.error("Unable to update AI request validation status.")
         raise
-    audit.finish(log_id, status="completed", result=result)
     return RFQDraft(fields, missing, {
-        "log_id": log_id,
+        "log_id": result.log_id,
         "prompt_id": result.prompt_id, "prompt_version": result.prompt_version,
         "model": result.model, "response_id": result.response_id,
     }, relevant, ambiguous)

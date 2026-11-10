@@ -189,6 +189,20 @@ RFQ table submission.
 
 ## AI request history
 
+Auditing now happens inside the shared `OpenAIService`, for **all** SDK requests,
+including RFQ, routine extraction and routine conversations. Feature callbacks must
+not create their own begin/finish records. `extract` and `converse` accept
+`audit_context` (`username`, `form_type`, `text`, optional `chat_message_id`) and
+return `log_id`; backend validation can mark that same row invalid. The default
+database is `data/fixed_income.db`; isolated callers/tests pass `database_path`.
+
+`RECORD_TYPE='REQUEST'` identifies individual attempts. `LEGACY_AGGREGATE` rows
+preserve previously consolidated routine usage and must be excluded when counting
+individual requests. Unknown historical prompt/model provenance is null.
+`CHAT_MESSAGE_ID` links calls to the chat interaction; `UGM_ROUTINE_CHAT` contains
+messages only and no token counters. Multi-call interactions therefore produce
+several central request rows, not one aggregate request.
+
 `AI_REQUEST_LOG` in the same SQLite database records every AI attempt independently
 of RFQ submission. The request is committed before the API call and completed when
 the response is processed. Canceling the modal or never creating an RFQ does not

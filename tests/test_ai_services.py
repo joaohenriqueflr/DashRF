@@ -42,7 +42,7 @@ class AIServiceTests(unittest.TestCase):
             model="test-model", id="response-123",
             usage=SimpleNamespace(input_tokens=1200, output_tokens=75, total_tokens=1275),
         )
-        service = OpenAIService(client=client)
+        service = OpenAIService(client=client, database_path=self.db)
         result = service.extract(
             prompt=self.store.get_active("screening", "extract"),
             payload={"text": "RFQ"}, schema={"type": "object", "properties": {"value": {"type": "integer"}}, "required": ["value"], "additionalProperties": False}, schema_name="rfq_test",
@@ -60,7 +60,7 @@ class AIServiceTests(unittest.TestCase):
 
     def test_provider_failures_are_sanitized_and_refusals_are_handled(self):
         client = Mock()
-        service = OpenAIService(client=client)
+        service = OpenAIService(client=client, database_path=self.db)
         kwargs = dict(prompt=self.store.get_active("screening", "extract"), payload={}, schema={}, schema_name="test")
         client.responses.create.side_effect = RuntimeError("sensitive-provider-detail")
         with self.assertRaises(AIError) as error:
@@ -85,7 +85,7 @@ class AIServiceTests(unittest.TestCase):
         client = Mock()
         response = SimpleNamespace(status="completed", output=[], output_text='{}', model="model", id="id")
         client.responses.create.return_value = response
-        service = OpenAIService(client=client)
+        service = OpenAIService(client=client, database_path=self.db)
         kwargs = dict(prompt=self.store.get_active("screening", "extract"), payload={}, schema={}, schema_name="test")
         result = service.extract(**kwargs)
         self.assertEqual((result.input_tokens, result.output_tokens, result.total_tokens), (None, None, None))
@@ -99,7 +99,7 @@ class AIServiceTests(unittest.TestCase):
         client = Mock()
         for invalid in [replace(prompt, model=""), replace(prompt, instructions="")]:
             with self.assertRaises(AIConfigurationError):
-                OpenAIService(client=client).extract(prompt=invalid, payload={}, schema={}, schema_name="test")
+                OpenAIService(client=client, database_path=self.db).extract(prompt=invalid, payload={}, schema={}, schema_name="test")
         client.responses.create.assert_not_called()
 
     def test_legacy_schema_adds_model_without_overwriting_prompts(self):
@@ -132,7 +132,7 @@ class AIServiceTests(unittest.TestCase):
     def test_missing_api_key_is_a_configuration_error(self):
         with patch.dict(os.environ, {"OPENAI_API_KEY": ""}):
             with self.assertRaises(AIConfigurationError):
-                OpenAIService()._get_client()
+                OpenAIService(database_path=self.db)._get_client()
 
     def test_validation_status_preserves_existing_model_failure_and_usage(self):
         audit = AIRequestLog(self.db)
@@ -190,6 +190,173 @@ class AIServiceTests(unittest.TestCase):
         self.assertEqual(rows, [(ids[0], 'Request 0', '  {"value": 1}  '),
                                 (ids[1], 'Request 1', '{"value": 2}'),
                                 (ids[2], 'Request 2', 'invalid model text')])
+
+    def audit_rows(self):
+        with closing(sqlite3.connect(self.db)) as conn:
+            conn.row_factory = sqlite3.Row
+            return [dict(row) for row in conn.execute("SELECT * FROM AI_REQUEST_LOG ORDER BY LOG_ID")]
+
+    def response(self, **changes):
+        return SimpleNamespace(**{
+            "status": "completed", "output": [], "output_text": '{ "value": 7 }',
+            "model": "actual-model", "id": "response-test",
+            "usage": {"input_tokens": 20, "output_tokens": 3, "total_tokens": 23}, **changes,
+        })
+
+    def test_transport_commits_one_audit_row_before_each_actual_sdk_call(self):
+        client = Mock()
+        prompt = self.store.get_active("screening", "extract")
+        service = OpenAIService(client=client, database_path=self.db)
+
+        def respond(**request):
+            row = self.audit_rows()[-1]
+            self.assertEqual(row["STATUS"], "running")
+            self.assertIsNone(row["DT_FINISHED"])
+            self.assertEqual(json.loads(row["FULL_PROMPT"]), request)
+            return self.response()
+
+        client.responses.create.side_effect = respond
+        kwargs = dict(prompt=prompt, payload={"request_text": "original text", "requester_username": "Alice"},
+                      schema={}, schema_name="test", audit_context={"form_type": "NTNB_RUN", "chat_message_id": 42})
+        first, second = service.extract(**kwargs), service.extract(**kwargs)
+        rows = self.audit_rows()
+        self.assertEqual(len(rows), client.responses.create.call_count)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([row["LOG_ID"] for row in rows], [first.log_id, second.log_id])
+        self.assertNotEqual(first.log_id, second.log_id)
+        for row in rows:
+            self.assertEqual((row["FEATURE"], row["FORM_TYPE"], row["USERNAME"]), ("screening", "NTNB_RUN", "Alice"))
+            self.assertEqual(row["PROMPT_TEXT"], "original text")
+            self.assertEqual((row["RECORD_TYPE"], row["CHAT_MESSAGE_ID"]), ("REQUEST", 42))
+            self.assertEqual(row["MODEL_OUTPUT"], '{ "value": 7 }')
+            self.assertEqual((row["MODEL"], row["INPUT_TOKENS"], row["OUTPUT_TOKENS"], row["TOTAL_TOKENS"]), ("actual-model", 20, 3, 23))
+            self.assertEqual((row["PROMPT_ID"], row["PROMPT_VERSION"]), (prompt.id, prompt.version))
+            self.assertEqual(row["STATUS"], "completed")
+
+    def test_conversation_tool_response_has_one_central_record_with_original_items(self):
+        client = Mock()
+        output = [{"type": "function_call", "name": "query_debtors", "call_id": "call-1", "arguments": "{}"}]
+        client.responses.create.return_value = self.response(output=output, output_text="")
+        service = OpenAIService(client=client, database_path=self.db)
+        result = service.converse(prompt=self.store.get_active("screening", "extract"),
+                                  items=[{"role": "user", "content": "query the cases"}], tools=[],
+                                  audit_context={"username": "Bob", "form_type": "DEBTORS", "chat_message_id": 10})
+        row, = self.audit_rows()
+        self.assertEqual(row["LOG_ID"], result.log_id)
+        self.assertEqual(json.loads(row["MODEL_OUTPUT"]), output)
+        self.assertEqual((row["USERNAME"], row["PROMPT_TEXT"], row["CHAT_MESSAGE_ID"]), ("Bob", "query the cases", 10))
+        self.assertEqual(json.loads(row["FULL_PROMPT"]), client.responses.create.call_args.kwargs)
+
+    def test_all_provider_and_response_failures_keep_one_record_and_usage(self):
+        client = Mock()
+        service = OpenAIService(client=client, database_path=self.db)
+        kwargs = dict(prompt=self.store.get_active("screening", "extract"), payload={}, schema={}, schema_name="test")
+        cases = [
+            ({"status": "incomplete", "output_text": '{"value":'}, "failed", "IncompleteResponse"),
+            ({"output": [{"content": [{"type": "refusal", "refusal": "Cannot process"}]}], "output_text": ""}, "failed", "ModelRefusal"),
+            ({"output_text": "broken JSON"}, "invalid_response", "InvalidJSON"),
+            ({"output_text": "[]"}, "invalid_response", "InvalidJSONShape"),
+        ]
+        for response_changes, status, error_type in cases:
+            with self.subTest(error_type=error_type):
+                client.responses.create.return_value = self.response(**response_changes)
+                before = len(self.audit_rows()) if client.responses.create.call_count else 0
+                with self.assertRaises(AIError) as raised:
+                    service.extract(**kwargs)
+                rows = self.audit_rows()
+                self.assertEqual(len(rows), before + 1)
+                row = rows[-1]
+                self.assertEqual(row["LOG_ID"], raised.exception.log_id)
+                self.assertEqual((row["STATUS"], row["ERROR_TYPE"]), (status, error_type))
+                self.assertEqual((row["INPUT_TOKENS"], row["OUTPUT_TOKENS"], row["TOTAL_TOKENS"]), (20, 3, 23))
+                self.assertIsNotNone(row["DT_FINISHED"])
+        client.responses.create.side_effect = RuntimeError("private provider detail")
+        with self.assertRaises(AIError) as raised:
+            service.extract(**kwargs)
+        row = self.audit_rows()[-1]
+        self.assertEqual((row["STATUS"], row["ERROR_TYPE"]), ("failed", "RuntimeError"))
+        self.assertEqual(row["LOG_ID"], raised.exception.log_id)
+        self.assertNotIn("private provider detail", row["ERROR_MESSAGE"])
+        self.assertIsNone(row["TOTAL_TOKENS"])
+
+    def test_audit_begin_failure_prevents_sdk_call_and_finish_failure_prevents_result_use(self):
+        client = Mock()
+        client.responses.create.return_value = self.response()
+        service = OpenAIService(client=client, database_path=self.db)
+        kwargs = dict(prompt=self.store.get_active("screening", "extract"), payload={}, schema={}, schema_name="test")
+        with patch.object(AIRequestLog, "begin", side_effect=sqlite3.OperationalError("private DB detail")):
+            with self.assertRaises(sqlite3.Error):
+                service.extract(**kwargs)
+        client.responses.create.assert_not_called()
+        self.assertEqual(self.audit_rows(), [])
+        with patch.object(AIRequestLog, "finish", side_effect=sqlite3.OperationalError("private DB detail")):
+            with self.assertRaises(AIError) as raised:
+                service.extract(**kwargs)
+        self.assertEqual(client.responses.create.call_count, 1)
+        row, = self.audit_rows()
+        self.assertEqual(row["STATUS"], "running")
+        self.assertEqual(raised.exception.error_type, "AuditPersistenceError")
+        self.assertEqual(raised.exception.log_id, row["LOG_ID"])
+        self.assertEqual((raised.exception.output_text, raised.exception.total_tokens), ('{ "value": 7 }', 23))
+        self.assertNotIn("private DB detail", str(raised.exception))
+
+    def test_nullable_prompt_migration_preserves_records_indexes_views_and_sequence(self):
+        audit = AIRequestLog(self.db)
+        audit.ensure_schema()
+        # Reproduce the historical NOT NULL provenance constraints.
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("DROP TABLE AI_REQUEST_LOG")
+            conn.execute("""CREATE TABLE AI_REQUEST_LOG (
+                LOG_ID INTEGER PRIMARY KEY AUTOINCREMENT, FEATURE TEXT NOT NULL,
+                FORM_TYPE TEXT NOT NULL,USERNAME TEXT NOT NULL,PROMPT_TEXT TEXT NOT NULL,
+                DT_STARTED TEXT NOT NULL,DT_FINISHED TEXT,PROMPT_ID INTEGER NOT NULL,
+                PROMPT_VERSION INTEGER NOT NULL,MODEL TEXT,MODEL_OUTPUT TEXT,STATUS TEXT NOT NULL,
+                ERROR_TYPE TEXT,ERROR_MESSAGE TEXT)""")
+            conn.execute("CREATE INDEX custom_audit_status ON AI_REQUEST_LOG(STATUS)")
+            conn.execute("CREATE VIEW custom_audit_view AS SELECT LOG_ID,STATUS FROM AI_REQUEST_LOG")
+            conn.execute("""INSERT INTO AI_REQUEST_LOG
+                (LOG_ID,FEATURE,FORM_TYPE,USERNAME,PROMPT_TEXT,DT_STARTED,PROMPT_ID,PROMPT_VERSION,STATUS)
+                VALUES(100,'rfq','sovereign','Alice','preserved','2026-11-04',1,1,'completed')""")
+            conn.execute("UPDATE sqlite_sequence SET seq=150 WHERE name='AI_REQUEST_LOG'")
+        audit.ensure_schema()
+        audit.ensure_schema()
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            columns = {row[1]: row for row in conn.execute("PRAGMA table_info(AI_REQUEST_LOG)")}
+            self.assertFalse(columns["PROMPT_ID"][3])
+            self.assertFalse(columns["PROMPT_VERSION"][3])
+            self.assertEqual(conn.execute("SELECT PROMPT_TEXT,RECORD_TYPE FROM AI_REQUEST_LOG WHERE LOG_ID=100").fetchone(), ("preserved", "REQUEST"))
+            self.assertEqual(conn.execute("SELECT * FROM custom_audit_view").fetchall(), [(100, "completed")])
+            indexes = {row[1] for row in conn.execute("PRAGMA index_list(AI_REQUEST_LOG)")}
+            self.assertIn("custom_audit_status", indexes)
+            self.assertIn("idx_ai_request_log_legacy_chat", indexes)
+            values = ('routines', 'NTNB_RUN', 'Alice', 'legacy interaction', '2026-11-04', 'completed', 'LEGACY_AGGREGATE', 42)
+            conn.execute("""INSERT INTO AI_REQUEST_LOG
+                (FEATURE,FORM_TYPE,USERNAME,PROMPT_TEXT,DT_STARTED,STATUS,RECORD_TYPE,CHAT_MESSAGE_ID)
+                VALUES(?,?,?,?,?,?,?,?)""", values)
+            legacy_id = conn.execute("SELECT LOG_ID FROM AI_REQUEST_LOG WHERE CHAT_MESSAGE_ID=42").fetchone()[0]
+            self.assertGreater(legacy_id, 150)
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute("""INSERT INTO AI_REQUEST_LOG
+                    (FEATURE,FORM_TYPE,USERNAME,PROMPT_TEXT,DT_STARTED,STATUS,RECORD_TYPE,CHAT_MESSAGE_ID)
+                    VALUES(?,?,?,?,?,?,?,?)""", values)
+        log_id = audit.begin(feature="screening", form_type="test", username="Alice", text="actual request",
+                             prompt=self.store.get_active("screening", "extract"), chat_message_id=42)
+        self.assertGreater(log_id, legacy_id)
+
+    def test_default_database_path_remains_mandatory_and_sdk_access_is_centralized(self):
+        import ast
+        from services.openai_client import DEFAULT_DATABASE_PATH
+        self.assertEqual(OpenAIService().database_path, DEFAULT_DATABASE_PATH)
+        root = Path(__file__).resolve().parents[1]
+        call_sites = []
+        for directory in (root / "services", root / "pages"):
+            for path in directory.glob("*.py"):
+                for node in ast.walk(ast.parse(path.read_text())):
+                    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                            and node.func.attr == "create" and isinstance(node.func.value, ast.Attribute)
+                            and node.func.value.attr == "responses"):
+                        call_sites.append(path.relative_to(root).as_posix())
+        self.assertEqual(call_sites, ["services/openai_client.py"])
 
 
 if __name__ == "__main__":

@@ -17,6 +17,10 @@ class Prompt:
     comment: str = None
 
 
+class PromptConflictError(ValueError):
+    """The active prompt changed after the editor loaded it."""
+
+
 class PromptStore:
     def __init__(self, database_path):
         self.database_path = Path(database_path)
@@ -32,6 +36,7 @@ class PromptStore:
                     INSTRUCTIONS TEXT NOT NULL,
                     MODEL TEXT NOT NULL,
                     "COMMENT" TEXT,
+                    CREATED_BY TEXT,
                     FL_ACTIVE INTEGER NOT NULL DEFAULT 1 CHECK (FL_ACTIVE IN (0, 1)),
                     DT_CREATED TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
                     UNIQUE (FEATURE, PROMPT_KEY, VERSION)
@@ -44,6 +49,8 @@ class PromptStore:
                 conn.execute("ALTER TABLE AI_PROMPTS ADD COLUMN MODEL TEXT")
             if "COMMENT" not in columns:
                 conn.execute('ALTER TABLE AI_PROMPTS ADD COLUMN "COMMENT" TEXT')
+            if "CREATED_BY" not in columns:
+                conn.execute('ALTER TABLE AI_PROMPTS ADD COLUMN CREATED_BY TEXT')
 
     def seed(self, feature, key, instructions, model, comment=None):
         """Insert the initial prompt once; never overwrite an edited prompt."""
@@ -71,7 +78,7 @@ class PromptStore:
             raise LookupError(f"No active prompt for {feature}/{key}.")
         return Prompt(*row)
 
-    def save_version(self, feature, key, instructions, model, comment=None):
+    def save_version(self, feature, key, instructions, model, comment=None, *, expected_version=None, created_by=None):
         """Activate a version; omit comment to inherit it, or pass '' to clear it."""
         if not instructions.strip():
             raise ValueError("Prompt instructions cannot be empty.")
@@ -80,6 +87,11 @@ class PromptStore:
         self.ensure_schema()
         with closing(sqlite3.connect(self.database_path, timeout=30)) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
+            if expected_version is not None:
+                active = conn.execute("""SELECT VERSION FROM AI_PROMPTS
+                    WHERE FEATURE=? AND PROMPT_KEY=? AND FL_ACTIVE=1""", (feature, key)).fetchone()
+                if active is None or active[0] != expected_version:
+                    raise PromptConflictError("This prompt changed since you opened it. Reload the active version and review your changes again.")
             if comment is None:
                 previous = conn.execute(
                     'SELECT "COMMENT" FROM AI_PROMPTS WHERE FEATURE = ? AND PROMPT_KEY = ? ORDER BY FL_ACTIVE DESC, VERSION DESC LIMIT 1',
@@ -94,9 +106,11 @@ class PromptStore:
                 "UPDATE AI_PROMPTS SET FL_ACTIVE = 0 WHERE FEATURE = ? AND PROMPT_KEY = ?",
                 (feature, key),
             )
-            conn.execute(
+            cursor = conn.execute(
                 """INSERT INTO AI_PROMPTS (FEATURE, PROMPT_KEY, VERSION, INSTRUCTIONS, MODEL, "COMMENT")
                    VALUES (?, ?, ?, ?, ?, ?)""",
                 (feature, key, version, instructions, model.strip(), comment),
             )
-        return self.get_active(feature, key)
+            conn.execute("UPDATE AI_PROMPTS SET CREATED_BY=? WHERE PROMPT_ID=?", (created_by, cursor.lastrowid))
+            saved = Prompt(cursor.lastrowid, feature, key, version, instructions, model.strip(), comment)
+        return saved

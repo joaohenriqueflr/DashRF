@@ -1,2 +1,4 @@
 # Additional dependency for AI assistance. Install into the environment running app.py.
 openai>=2.0.0,<4
+# UGM Routines: deterministic manual XLSX imports.
+openpyxl>=3.1.0,<4
