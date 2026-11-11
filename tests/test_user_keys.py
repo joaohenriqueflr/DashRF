@@ -80,3 +80,35 @@ class UserKeysTests(unittest.TestCase):
         with closing(sqlite3.connect(self.db)) as conn:
             row = conn.execute("SELECT KEY_ID, USR_NAME FROM USER_KEYS WHERE USR_NAME = 'New Trader'").fetchone()
         self.assertEqual(row, (31, "New Trader"))
+
+    def test_master_can_create_and_activate_gwm_profile(self):
+        master = {"user": "Master", "role": "master"}
+        refresh, message = self.page.create_key(1, "New GWM", "gwm", master, 0)
+        self.assertEqual(refresh, 1)
+        with closing(sqlite3.connect(self.db)) as conn:
+            key, role = conn.execute("SELECT SECRET_KEY, ROLE FROM USER_KEYS WHERE USR_NAME='New GWM'").fetchone()
+        self.assertEqual(role, "gwm")
+        profile, _, _ = self.page.activate_key(1, key)
+        self.assertEqual(profile["role"], "gwm")
+        self.assertEqual(profile["user"], "New GWM")
+        self.assertEqual(self.page.load_keys_grid(0, profile), [])
+        self.assertEqual(self.page.toggle_admin_panel(profile), {"display": "none"})
+        self.assertIn("Only master", self.page.create_key(1, "Forbidden", "master", profile, 0)[1])
+
+    def test_login_remembers_identity_in_signed_server_session(self):
+        from flask import Flask, session
+
+        server = Flask(__name__)
+        server.secret_key = "user-keys-test-only"
+        with server.test_request_context():
+            self.page.activate_key(1, "test-trader-key")
+            self.assertEqual(session["user_key_id"], 8)
+
+    def test_unknown_profile_type_is_rejected(self):
+        from dash import no_update
+
+        refresh, message = self.page.create_key(1, "Invalid", "other", {"role": "master"}, 0)
+        self.assertIs(refresh, no_update)
+        self.assertIn("valid profile", message)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM USER_KEYS").fetchone()[0], len(self.records))

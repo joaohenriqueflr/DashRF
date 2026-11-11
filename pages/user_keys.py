@@ -3,6 +3,7 @@ import sqlite3
 from contextlib import closing
 from datetime import date
 from pathlib import Path
+from flask import current_app, has_request_context, session
 
 from dash import Input, Output, State, callback, dcc, html, no_update, register_page
 import dash_ag_grid as dag
@@ -166,6 +167,7 @@ layout = dbc.Container(
                             id="keys-role",
                             options=[
                                 {"label": "Trader", "value": "trader"},
+                                {"label": "GWM", "value": "gwm"},
                                 {"label": "Master", "value": "master"},
                             ],
                             value="trader",
@@ -228,6 +230,8 @@ def activate_key(n_clicks, secret_key):
         "email": row["EMAIL"],
         "role": row["ROLE"],
     }
+    if has_request_context() and current_app.secret_key:
+        session["user_key_id"] = row["KEY_ID"]
     return user_data, f"Active session: {row['USR_NAME']} ({row['ROLE']}).", ""
 
 
@@ -289,6 +293,8 @@ def create_key(n_clicks, user_name, role, current_user, refresh_value):
     if not user_name:
         return no_update, "Enter a user name before creating a key."
     role_value = role or "trader"
+    if role_value not in {"trader", "master", "gwm"}:
+        return no_update, "Select a valid profile type."
     new_key = secrets.token_urlsafe(10)
     email = _derive_email(user_name)
     try:

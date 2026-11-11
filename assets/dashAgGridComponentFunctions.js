@@ -161,6 +161,15 @@ dagcomponentfuncs.rfqParseNumber = function (value) {
     return Number.isFinite(parsed) ? parsed : NaN;
 };
 
+dagcomponentfuncs.rfqQuoteFields = function (data) {
+    if (Object.prototype.hasOwnProperty.call(data, "best_quote")) {
+        return ["best_quote"];
+    }
+    return Object.keys(data).filter(function (key) {
+        return key.indexOf("cp_") === 0;
+    });
+};
+
 dagcomponentfuncs.RfqQuoteHighlight = function (params) {
     if (!params || !params.data) {
         return false;
@@ -169,9 +178,7 @@ dagcomponentfuncs.RfqQuoteHighlight = function (params) {
     if (direction !== "buy" && direction !== "sell") {
         return false;
     }
-    var keys = Object.keys(params.data).filter(function (key) {
-        return key.indexOf("cp_") === 0;
-    });
+    var keys = dagcomponentfuncs.rfqQuoteFields(params.data);
     if (!keys.length) {
         return false;
     }
@@ -208,9 +215,7 @@ dagcomponentfuncs.RfqLimitHighlight = function (params) {
     if (!Number.isFinite(limitValue)) {
         return false;
     }
-    var keys = Object.keys(params.data).filter(function (key) {
-        return key.indexOf("cp_") === 0;
-    });
+    var keys = dagcomponentfuncs.rfqQuoteFields(params.data);
     if (!keys.length) {
         return false;
     }
@@ -244,6 +249,39 @@ window.dashAgGridFunctions.rfqLimitHighlight = function (params) {
     var dc = (window.dash_clientside = window.dash_clientside || {});
     dc.rfq = dc.rfq || {};
 
+    function sameData(left, right) {
+        if (left === right || (left == null && right == null)) return true;
+        if (!left || !right || typeof left !== "object" || typeof right !== "object") return false;
+        if (Array.isArray(left) !== Array.isArray(right)) return false;
+        var keys = Object.keys(left);
+        return keys.length === Object.keys(right).length && keys.every(function (key) {
+            return Object.prototype.hasOwnProperty.call(right, key) && sameData(left[key], right[key]);
+        });
+    }
+
+    dc.rfq.applyLiveSnapshot = function (snapshot, tab, showActive, user, refresh, editEvent, rows, columns) {
+        var noUpdate = window.dash_clientside.no_update;
+        var unchanged = [noUpdate, noUpdate];
+        var view = [tab, Boolean(showActive), user, refresh, editEvent];
+        if (!snapshot || !sameData(snapshot.view, view)) {
+            return unchanged;
+        }
+        try {
+            var api = window.dash_ag_grid.getApi("rfq-grid");
+            // Check on delivery too: the user may have started typing during the request.
+            if (!api || api.getEditingCells().length) {
+                return unchanged;
+            }
+        } catch (error) {
+            // A page change can destroy the grid while a poll is in flight.
+            return unchanged;
+        }
+        return [
+            sameData(rows, snapshot.rows) ? noUpdate : snapshot.rows,
+            sameData(columns, snapshot.columns) ? noUpdate : snapshot.columns,
+        ];
+    };
+
     function getVisibleColumns(columnDefs) {
         if (!Array.isArray(columnDefs)) {
             return [];
@@ -267,7 +305,7 @@ window.dashAgGridFunctions.rfqLimitHighlight = function (params) {
             return "";
         }
         var text = value.toString();
-        if (field && field.indexOf("cp_") === 0) {
+        if (field && (field.indexOf("cp_") === 0 || field === "best_quote")) {
             var parts = text.split("|");
             var quote = (parts[0] || "").trim();
             var time = (parts[1] || "").trim();
@@ -301,6 +339,7 @@ window.dashAgGridFunctions.rfqLimitHighlight = function (params) {
     }
 
     function fallbackCopy(text) {
+        var previousFocus = document.activeElement;
         var textarea = document.createElement("textarea");
         textarea.value = text;
         textarea.setAttribute("readonly", "");
@@ -308,27 +347,53 @@ window.dashAgGridFunctions.rfqLimitHighlight = function (params) {
         textarea.style.left = "-9999px";
         textarea.style.top = "0";
         document.body.appendChild(textarea);
-        textarea.select();
         try {
-            document.execCommand("copy");
+            textarea.focus();
+            textarea.select();
+            textarea.setSelectionRange(0, text.length);
+            return document.execCommand("copy") === true;
+        } catch (error) {
+            return false;
         } finally {
             document.body.removeChild(textarea);
+            if (previousFocus && typeof previousFocus.focus === "function") {
+                previousFocus.focus({preventScroll: true});
+            }
         }
     }
 
     function copyText(text) {
         if (
+            window.isSecureContext !== false &&
             window.navigator &&
             window.navigator.clipboard &&
             typeof window.navigator.clipboard.writeText === "function"
         ) {
-            window.navigator.clipboard.writeText(text).catch(function () {
-                fallbackCopy(text);
-            });
-            return;
+            try {
+                return Promise.resolve(window.navigator.clipboard.writeText(text)).then(
+                    function () { return true; },
+                    function () { return fallbackCopy(text); }
+                );
+            } catch (error) {
+                return Promise.resolve(fallbackCopy(text));
+            }
         }
-        fallbackCopy(text);
+        // Run synchronously in the click handler when the secure API is unavailable.
+        return Promise.resolve(fallbackCopy(text));
     }
+
+    dc.rfq.copyTradeToClipboard = function (row) {
+        var text = row && row.rfq_copy_text;
+        if (!text) {
+            return Promise.resolve(false);
+        }
+        return copyText(text).then(function (copied) {
+            if (!copied) {
+                window.prompt("Automatic copy is unavailable. Copy this RFQ text:", text);
+            }
+            return copied;
+        });
+    };
 
     dc.rfq.copyGridToClipboard = function (nClicks, rowData, columnDefs) {
         if (!nClicks) {
@@ -342,16 +407,19 @@ window.dashAgGridFunctions.rfqLimitHighlight = function (params) {
                 timestamp: Date.now(),
             };
         }
-        copyText(text);
-        return {
-            copied: true,
-            rows: Array.isArray(rowData) ? rowData.length : 0,
-            timestamp: Date.now(),
-        };
+        return copyText(text).then(function (copied) {
+            return {
+                copied: copied,
+                rows: Array.isArray(rowData) ? rowData.length : 0,
+                timestamp: Date.now(),
+            };
+        });
     };
 })();
 
 dagcomponentfuncs.RfqActionsCell = function (props) {
+    var quoteType = String((props.data || {}).quote_format || "").trim().toLowerCase();
+    var canConclude = !props.mktColorOnly || quoteType === "mkt color";
     return React.createElement(
         "div",
         { className: "rfq-actions" },
@@ -362,12 +430,8 @@ dagcomponentfuncs.RfqActionsCell = function (props) {
                 title: "Copy RFQ",
                 onClick: function (event) {
                     event.stopPropagation();
-                    if (props && typeof props.setData === "function") {
-                        props.setData({
-                            action: "copy",
-                            rfq_id: props.data ? props.data.rfq_id : null,
-                        });
-                    }
+                    // Keep copying inside the user's click; no server round trip.
+                    return window.dash_clientside.rfq.copyTradeToClipboard(props && props.data);
                 },
             },
             "⧉"
@@ -376,10 +440,10 @@ dagcomponentfuncs.RfqActionsCell = function (props) {
             "span",
             {
                 className: "rfq-action success",
-                title: "Close RFQ",
+                title: canConclude ? "Close RFQ" : "GWM users can conclude Mkt Color RFQs only",
                 onClick: function (event) {
                     event.stopPropagation();
-                    if (props && typeof props.setData === "function") {
+                    if (canConclude && typeof props.setData === "function") {
                         props.setData({
                             action: "close",
                             rfq_id: props.data ? props.data.rfq_id : null,

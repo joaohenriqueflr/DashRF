@@ -116,6 +116,14 @@ the Python page, supplied through each `rfq-ai-ui-config-*` store. Callbacks use
 form settings does not change the function Dash calls. The asset loads before Dash's
 renderer. Refresh an already-open tab after updating the clientside code.
 
+Individual RFQ copying and Copy Grid share the browser helper in
+`assets/dashAgGridComponentFunctions.js`. Python prepares each row's `rfq_copy_text`
+using `_build_rfq_text()`; the row button copies it directly during the click instead
+of waiting for a server callback. Where the secure Clipboard API is unavailable or
+denied, the helper tries the browser's selection-based copy method. If both methods
+are denied for an individual RFQ, a prompt provides the text for manual copying.
+The close/conclude action remains a server callback.
+
 `rfq_json_contract(asset_class, username, sovereign_assets=...)` defines a separate JSON contract for:
 
 - `sovereign`: direction, requester, bond type, maturity, quantity,

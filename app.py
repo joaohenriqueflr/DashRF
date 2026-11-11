@@ -1,9 +1,12 @@
 import re
 
 from dash import Dash, Input, Output, State, callback, ctx, dcc, html
+from flask import session
 import dash
 import dash_bootstrap_components as dbc
 import dash_mantine_components as dmc
+
+from services.access import install_access_controls, internal_access_denied, load_session_secret
 
 app = Dash(
     __name__,
@@ -15,7 +18,11 @@ app = Dash(
         "https://code.highcharts.com/highcharts-more.js",
     ],
     suppress_callback_exceptions=True,
+    routing_callback_inputs={"current_user": Input("current-user", "data")},
 )
+app.server.secret_key = load_session_secret()
+app.server.config["SESSION_COOKIE_HTTPONLY"] = True
+app.server.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
 app.index_string = """
 <!DOCTYPE html>
@@ -39,7 +46,9 @@ app.index_string = """
 
 def nav_group(label, slug, links):
     return html.Div(
+        id=f"nav-{slug}-group",
         className="nav-group",
+        style={"display": "none"} if slug in ("fx", "ugm") else {},
         children=[
             html.Button(
                 [label, html.Span(className="nav-chevron", **{"aria-hidden": "true"})],
@@ -234,7 +243,7 @@ def update_user_fab(current_user):
         email = f"{handle}@trading.com" if handle else "user@trading.com"
     role = current_user.get("role") or ""
     if role:
-        role_display = role.replace("_", " ").strip().title()
+        role_display = "GWM" if role.lower() == "gwm" else role.replace("_", " ").strip().title()
     else:
         role_display = "--"
     return initials, initials, user_name, email, role_display, "user-fab"
@@ -252,12 +261,25 @@ def update_user_fab(current_user):
 )
 def update_user_session(login_clicks, login_submits, logout_clicks, secret_key):
     if ctx.triggered_id == "user-logout":
+        session.pop("user_key_id", None)
         return None, "", ""
 
     # Reuse the Access page's active-key validation and session format.
     from pages.user_keys import activate_key
 
     return activate_key(login_clicks or login_submits, secret_key)
+
+
+@callback(
+    Output("nav-fx-group", "style"), Output("nav-ugm-group", "style"),
+    Input("current-user", "data"),
+)
+def restrict_navigation(current_user):
+    style = {"display": "none"} if internal_access_denied(current_user) else {}
+    return style, style
+
+
+install_access_controls(app)
 
 
 if __name__ == "__main__":

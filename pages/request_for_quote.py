@@ -33,6 +33,7 @@ import dash_mantine_components as dmc
 from services.openai_client import AIConfigurationError, AIError, OpenAIService
 from services.ai_audit import AIRequestLog
 from services.prompts import PromptStore
+from services.access import current_profile
 
 register_page(__name__, path="/rfq", name="UGM Request for Quote")
 
@@ -591,9 +592,16 @@ def load_security_maturity(security_name):
         return None
 
 
-def build_rfq_columns(counterparties):
+def build_rfq_columns(counterparties, *, best_only=False, mkt_color_only=False):
     columns = list(RFQ_BASE_COLUMNS)
-    for name in counterparties:
+    if best_only:
+        columns.append({
+            "headerName": "Best", "field": "best_quote", "cellClass": "rfq-quote-cell",
+            "minWidth": 110, "editable": False, "wrapText": True, "autoHeight": True,
+            "cellRenderer": "RfqQuoteCell",
+            "cellClassRules": {"rfq-quote-highlight": "rfqQuoteHighlight(params)"},
+        })
+    for name in ([] if best_only else counterparties):
         columns.append(
             {
                 "headerName": name,
@@ -615,13 +623,33 @@ def build_rfq_columns(counterparties):
             "field": "actions",
             "maxWidth": 90,
             "cellRenderer": "RfqActionsCell",
+            "cellRendererParams": {"mktColorOnly": mkt_color_only},
             "cellClass": "rfq-actions-cell",
         }
     )
     return columns
 
 
-def load_rfq_rows(asset_class, counterparties, show_active=True):
+def best_rfq_quote(quotes, direction):
+    """Match the grid's existing best-yield rule and numeric-prefix parser."""
+    direction = str(direction or "").strip().lower()
+    if direction not in ("buy", "sell"):
+        return "--"
+    parsed = []
+    for quote in quotes:
+        text = str(quote or "").split("|", 1)[0].replace(",", "").strip()
+        match = re.match(r"^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?", text)
+        if match:
+            number = float(match.group())
+            if math.isfinite(number):
+                parsed.append((number, quote))
+    if not parsed:
+        return "--"
+    select = max if direction == "buy" else min
+    return select(parsed, key=lambda item: item[0])[1]
+
+
+def load_rfq_rows(asset_class, counterparties, show_active=True, *, best_only=False):
     broker_map = {name: _counterparty_slug(name) for name in counterparties}
     active_flag = 1 if show_active else 0
     try:
@@ -686,31 +714,33 @@ def load_rfq_rows(asset_class, counterparties, show_active=True):
         for broker_name, (_, response_text) in latest_by_broker.items():
             broker_fields[broker_map[broker_name]] = response_text
 
+        quote_fields = {"best_quote": best_rfq_quote(broker_fields.values(), row["DIRECTION"])} if best_only else broker_fields
+
         if latest_timestamp:
             time_value = latest_timestamp.strftime("%H:%M")
         else:
             time_value = _extract_time(row["DT_INPUT"]) or "00:00"
 
-        formatted.append(
-            {
-                "rfq_id": row["RFQ_ID"],
-                "asset_class": row["CLASS"] or "",
-                "time": time_value,
-                "trader": row["USR_INPUT"] or "--",
-                "requester": row["REQUESTER"] or "--",
-                "direction": row["DIRECTION"] or "--",
-                "security": row["SEC_NAME"] or "--",
-                "maturity": row["DT_MATURITY"] or "--",
-                "quantity": _format_quantity(row["QTY"]),
-                "quantity_raw": row["QTY"],
-                "volume": _format_volume(row["VOLUME"]),
-                "volume_raw": row["VOLUME"],
-                "quote_format": row["TYPE"] or "--",
-                "client_limit": _format_limit(row["limit_value"]),
-                **broker_fields,
-                "actions": "draft",
-            }
-        )
+        formatted_row = {
+            "rfq_id": row["RFQ_ID"],
+            "asset_class": row["CLASS"] or "",
+            "time": time_value,
+            "trader": row["USR_INPUT"] or "--",
+            "requester": row["REQUESTER"] or "--",
+            "direction": row["DIRECTION"] or "--",
+            "security": row["SEC_NAME"] or "--",
+            "maturity": row["DT_MATURITY"] or "--",
+            "quantity": _format_quantity(row["QTY"]),
+            "quantity_raw": row["QTY"],
+            "volume": _format_volume(row["VOLUME"]),
+            "volume_raw": row["VOLUME"],
+            "quote_format": row["TYPE"] or "--",
+            "client_limit": _format_limit(row["limit_value"]),
+            **quote_fields,
+            "actions": "draft",
+        }
+        formatted_row["rfq_copy_text"] = _build_rfq_text(formatted_row)
+        formatted.append(formatted_row)
     return formatted
 
 
@@ -1640,9 +1670,9 @@ layout = dbc.Container(
         dcc.Store(id="rfq-refresh", data=0),
         dcc.Store(id="rfq-sovereign-assets", data=[]),
         dcc.Store(id="rfq-corporate-options", data=[]),
-        dcc.Clipboard(id="rfq-copy-clipboard", style={"display": "none"}),
         dcc.Store(id="rfq-grid-copy-result"),
-        dcc.Store(id="rfq-copy-text", data=""),
+        dcc.Store(id="rfq-live-snapshot"),
+        dcc.Interval(id="rfq-live-interval", interval=2000, disabled=True),
         html.Div(
             className="rfq-hero",
             children=[
@@ -1654,7 +1684,14 @@ layout = dbc.Container(
             ],
         ),
         html.Div(
+            "Sign in using the account bubble to view RFQs.",
+            id="rfq-auth-message",
+            className="alert alert-info",
+            role="status",
+        ),
+        html.Div(
             id="rfq-auth-content",
+            style={"display": "none"},
             children=[
         html.Div(
             className="rfq-tabs-card",
@@ -2022,14 +2059,8 @@ layout = dbc.Container(
                 dag.AgGrid(
                     id="rfq-grid",
                     className="ag-theme-alpine rfq-grid",
-                    columnDefs=build_rfq_columns(
-                        load_counterparties("Sovereign Bond")
-                    ),
-                    rowData=load_rfq_rows(
-                        "Sovereign Bond",
-                        load_counterparties("Sovereign Bond"),
-                        show_active=True,
-                    ),
+                    columnDefs=build_rfq_columns([]),
+                    rowData=[],
                     getRowId="params.data.rfq_id",
                     defaultColDef={
                         "sortable": True,
@@ -2071,12 +2102,17 @@ layout = dbc.Container(
 
 @callback(
     Output("rfq-auth-content", "style"),
+    Output("rfq-auth-message", "children"),
+    Output("rfq-auth-message", "style"),
+    Output("rfq-live-interval", "disabled"),
     Input("current-user", "data"),
 )
 def toggle_rfq_auth_content(current_user):
-    if current_user and current_user.get("user"):
-        return {"display": "block"}
-    return {"display": "none"}
+    if current_profile(current_user, DATABASE_PATH):
+        return {"display": "block"}, "", {"display": "none"}, False
+    message = ("Your session has expired. Sign in again using the account bubble to view RFQs."
+               if current_user else "Sign in using the account bubble to view RFQs.")
+    return {"display": "none"}, message, {"display": "block"}, True
 
 
 def register_rfq_ai_callback(asset_class):
@@ -2147,9 +2183,10 @@ def register_rfq_ai_callback(asset_class):
         ],
     )
     def fill_rfq_form(_clicks, text, current_user, opened, sovereign_assets=None, corporate_options=None):
-        if not opened or not current_user or not current_user.get("user"):
+        profile = current_profile(current_user, DATABASE_PATH)
+        if not opened or not profile:
             raise PreventUpdate
-        username = current_user["user"]
+        username = profile["user"]
         fields = [] if asset_class in MULTI_TRADE_ASSETS else rfq_empty_form(asset_class, username)
         metadata = {}
         review = False
@@ -2391,8 +2428,17 @@ def manage_rfq_trade_blocks(asset_class, _add, _remove, opened, assets, ai_resul
     Input("rfq-tabs", "value"),
     Input("rfq-refresh", "data"),
     Input("rfq-active-switch", "checked"),
+    Input("current-user", "data"),
 )
-def switch_rfq_tab(active_tab, _refresh, show_active):
+def switch_rfq_tab(active_tab, _refresh, show_active, current_user=None):
+    return load_rfq_grid_view(active_tab, show_active, current_user)
+
+
+def load_rfq_grid_view(active_tab, show_active, current_user=None):
+    """Use the same authenticated view for local actions and live updates."""
+    profile = current_profile(current_user, DATABASE_PATH)
+    if not profile:
+        return [], [html.Span("+", className="rfq-create-icon"), html.Span("Create RFQ")], build_rfq_columns([])
     class_map = {
         "sovereign": ("Sovereign Bond", "Sovereign Bond"),
         "corporate": ("Corporate Bond", "Corporate Bond"),
@@ -2402,21 +2448,61 @@ def switch_rfq_tab(active_tab, _refresh, show_active):
         active_tab, ("Sovereign Bond", "Sovereign Bond")
     )
     counterparties = load_counterparties(counterparty_class)
+    best_only = str(profile.get("role", "")).lower() == "gwm" and active_tab in MULTI_TRADE_ASSETS
+    rows = load_rfq_rows(rfq_class, counterparties, show_active=bool(show_active), best_only=best_only)
     if active_tab == "corporate":
-        rows = load_rfq_rows(rfq_class, counterparties, show_active=bool(show_active))
         label = "Create Corporate RFQ"
     elif active_tab == "derivatives":
-        rows = load_rfq_rows(rfq_class, counterparties, show_active=bool(show_active))
         label = "Create Derivatives RFQ"
     else:
-        rows = load_rfq_rows(rfq_class, counterparties, show_active=bool(show_active))
         label = "Create Sovereign RFQ"
-    columns = build_rfq_columns(counterparties)
+    columns = build_rfq_columns(
+        counterparties, best_only=best_only,
+        mkt_color_only=str(profile.get("role", "")).lower() == "gwm",
+    )
     if not show_active:
         for col in columns:
             if col.get("field", "").startswith("cp_"):
                 col["editable"] = False
     return rows, [html.Span("+", className="rfq-create-icon"), html.Span(label)], columns
+
+
+@callback(
+    Output("rfq-live-snapshot", "data"),
+    Input("rfq-live-interval", "n_intervals"),
+    State("rfq-tabs", "value"),
+    State("rfq-active-switch", "checked"),
+    State("current-user", "data"),
+    State("rfq-refresh", "data"),
+    State("rfq-grid", "rowData"),
+    State("rfq-grid", "columnDefs"),
+    State("rfq-grid", "cellValueChanged"),
+    prevent_initial_call=True,
+)
+def poll_rfq_grid(tick, active_tab, show_active, current_user, refresh, current_rows, current_columns, edit_event):
+    rows, _, columns = load_rfq_grid_view(active_tab, show_active, current_user)
+    if rows == current_rows and columns == current_columns:
+        raise PreventUpdate
+    return {
+        "tick": tick, "rows": rows, "columns": columns,
+        "view": [active_tab, bool(show_active), current_user, refresh, edit_event],
+    }
+
+
+clientside_callback(
+    ClientsideFunction(namespace="rfq", function_name="applyLiveSnapshot"),
+    Output("rfq-grid", "rowData", allow_duplicate=True),
+    Output("rfq-grid", "columnDefs", allow_duplicate=True),
+    Input("rfq-live-snapshot", "data"),
+    State("rfq-tabs", "value"),
+    State("rfq-active-switch", "checked"),
+    State("current-user", "data"),
+    State("rfq-refresh", "data"),
+    State("rfq-grid", "cellValueChanged"),
+    State("rfq-grid", "rowData"),
+    State("rfq-grid", "columnDefs"),
+    prevent_initial_call=True,
+)
 
 
 def rfq_batch_errors(asset_class, errors):
@@ -2436,7 +2522,7 @@ def submit_sovereign_batch(field_ids, field_values, assets, current_user, refres
 
 def submit_fixed_income_batch(asset_class, field_ids, field_values, assets, current_user, refresh_value):
     """Validate every live block before inserting the entire batch atomically."""
-    username = (current_user or {}).get("user") or ""
+    username = (current_profile(current_user, DATABASE_PATH) or {}).get("user") or ""
     if not username:
         return rfq_batch_errors(asset_class, ["Sign in before creating RFQs."])
     trades = collect_rfq_trades(field_ids, field_values)
@@ -2592,7 +2678,7 @@ def submit_rfq(
 
     security_text = str(bond_name).strip() if bond_name is not None else ""
     maturity_text = str(maturity).strip() if maturity not in (None, "") else ""
-    requester = (current_user or {}).get("user") or ""
+    requester = (current_profile(current_user, DATABASE_PATH) or {}).get("user") or ""
     qty_text = str(qty).strip() if qty not in (None, "") else ""
     volume_text = str(volume).strip() if volume not in (None, "") else ""
     limit_text = str(limit_value).strip() if limit_value not in (None, "") else ""
@@ -2737,12 +2823,16 @@ def submit_rfq(
     Input("rfq-grid", "cellValueChanged"),
     State("rfq-active-switch", "checked"),
     State("rfq-refresh", "data"),
+    State("current-user", "data"),
     prevent_initial_call=True,
 )
-def append_broker_response(event, show_active, refresh_value):
+def append_broker_response(event, show_active, refresh_value, current_user=None):
     if not event:
         raise PreventUpdate
     if not show_active:
+        raise PreventUpdate
+    profile = current_profile(current_user, DATABASE_PATH)
+    if not profile:
         raise PreventUpdate
     if isinstance(event, list):
         if not event:
@@ -2768,9 +2858,11 @@ def append_broker_response(event, show_active, refresh_value):
             conn.row_factory = sqlite3.Row
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                'SELECT STR_RESPONSE FROM RFQ WHERE RFQ_ID = ?',
+                'SELECT STR_RESPONSE, CLASS FROM RFQ WHERE RFQ_ID = ?',
                 (rfq_id,),
             ).fetchone()
+            if row and row["CLASS"] in ("Sovereign Bond", "Corporate Bond") and str(profile.get("role", "")).lower() == "gwm":
+                raise PreventUpdate
             existing, responses_changed = _normalize_response_entries(
                 _parse_response(row["STR_RESPONSE"] if row else None)
             )
@@ -2846,71 +2938,37 @@ def append_broker_response(event, show_active, refresh_value):
 
 @callback(
     Output("rfq-refresh", "data", allow_duplicate=True),
-    Output("rfq-copy-clipboard", "content"),
-    Output("rfq-copy-clipboard", "n_clicks"),
     Input("rfq-grid", "cellRendererData"),
-    State("rfq-grid", "rowData"),
     State("rfq-active-switch", "checked"),
     State("current-user", "data"),
     State("rfq-refresh", "data"),
-    State("rfq-copy-clipboard", "n_clicks"),
     prevent_initial_call=True,
 )
-def handle_rfq_action(
-    event,
-    row_data,
-    show_active,
-    current_user,
-    refresh_value,
-    copy_clicks,
-):
-    if not event:
-        raise PreventUpdate
-    if not show_active:
+def handle_rfq_action(event, show_active, current_user, refresh_value):
+    if not event or not show_active:
         raise PreventUpdate
     payload = event.get("value") if isinstance(event, dict) else event
-    if not isinstance(payload, dict):
+    if not isinstance(payload, dict) or payload.get("action") != "close":
         raise PreventUpdate
-    action = payload.get("action")
     rfq_id = payload.get("rfq_id")
-    if not action or rfq_id is None:
+    profile = current_profile(current_user, DATABASE_PATH)
+    if rfq_id is None or not profile:
         raise PreventUpdate
-
-    if action == "close":
-        usr_closed = (current_user or {}).get("user") or "Unknown User"
-        dt_closed = datetime.now().isoformat(timespec="minutes")
-        try:
-            with closing(sqlite3.connect(DATABASE_PATH)) as conn, conn:
-                conn.execute(
-                    """
-                    UPDATE RFQ
-                    SET FL_ACTIVE = 0, USR_CLOSED = ?, DT_CLOSED = ?
-                    WHERE RFQ_ID = ?
-                    """,
-                    (usr_closed, dt_closed, rfq_id),
-                )
-                conn.commit()
-        except sqlite3.Error:
-            raise PreventUpdate
-        return (refresh_value or 0) + 1, no_update, no_update
-
-    if action != "copy":
+    mkt_color_only = str(profile.get("role", "")).lower() == "gwm"
+    dt_closed = datetime.now().isoformat(timespec="minutes")
+    try:
+        with closing(sqlite3.connect(DATABASE_PATH)) as conn, conn:
+            updated = conn.execute(
+                """UPDATE RFQ SET FL_ACTIVE = 0, USR_CLOSED = ?, DT_CLOSED = ?
+                   WHERE RFQ_ID = ? AND FL_ACTIVE = 1
+                     AND (? = 0 OR lower(trim(COALESCE(TYPE, ''))) = lower(?))""",
+                (profile["user"], dt_closed, rfq_id, mkt_color_only, FIXED_INCOME_QUOTE_TYPE),
+            )
+            if not updated.rowcount:
+                raise PreventUpdate
+    except sqlite3.Error:
         raise PreventUpdate
-
-    if not row_data:
-        raise PreventUpdate
-    target = None
-    for row in row_data:
-        if str(row.get("rfq_id")) == str(rfq_id):
-            target = row
-            break
-    if not target:
-        raise PreventUpdate
-
-    copy_text = _build_rfq_text(target)
-    if not copy_text:
-        raise PreventUpdate
-    return no_update, copy_text, (copy_clicks or 0) + 1
+    return (refresh_value or 0) + 1
 
 
 clientside_callback(

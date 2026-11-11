@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from services.prompts import PromptStore
+from services.access import load_session_secret
 
 HAS_DASH = all(importlib.util.find_spec(name) for name in (
     "dash", "dash_ag_grid", "dash_bootstrap_components", "dash_mantine_components",
@@ -38,6 +39,10 @@ class RFQAITests(unittest.TestCase):
                 INSERT INTO RFQ_REQUESTERS VALUES ('Alice');
                 CREATE TABLE RFQ_COUNTERPARTY (TP_TRADE TEXT, NM_COUNTERPARTY TEXT, FL_ACTIVE INTEGER);
                 INSERT INTO RFQ_COUNTERPARTY VALUES ('Sovereign Bond', 'Test Broker', 1);
+                CREATE TABLE USER_KEYS (KEY_ID INTEGER PRIMARY KEY, USR_NAME TEXT, EMAIL TEXT, ROLE TEXT, FL_ACTIVE INTEGER);
+                INSERT INTO USER_KEYS VALUES (9001, 'GWM Test User', 'gwm@example.test', 'gwm', 1);
+                INSERT INTO USER_KEYS VALUES (9002, 'Trader Test User', 'trader@example.test', 'trader', 1);
+                INSERT INTO USER_KEYS VALUES (9003, 'Master Test User', 'master@example.test', 'master', 1);
                 CREATE TABLE FIXED_INCOME_SECURITY_CLASSIFICATION (
                     NM_SECURITY TEXT, NM_ISSUER TEXT, DT_MATURITY TEXT,
                     NM_INDEX TEXT, NM_SECTOR TEXT, NM_INSTRUMENT_TYPE TEXT
@@ -55,6 +60,7 @@ class RFQAITests(unittest.TestCase):
             """)
         cls.app = Dash("rfq_ai_tests", suppress_callback_exceptions=True,
                        assets_folder=str(Path(__file__).resolve().parents[1] / "assets"))
+        cls.app.server.secret_key = "rfq-tests-only"
         cls.page = types.ModuleType("rfq_ai_test_page")
         cls.page.__file__ = str(cls.root / "pages" / "request_for_quote.py")
         sys.modules[cls.page.__name__] = cls.page
@@ -77,7 +83,7 @@ class RFQAITests(unittest.TestCase):
         sys.modules.pop(cls.page.__name__, None)
         cls.temp.cleanup()
 
-    def dispatch(self, output_fragment, values, changed, match_trade=None):
+    def dispatch(self, output_fragment, values, changed, match_trade=None, expected_status=200, client=None):
         values = {"rfq-sovereign-assets.data": self.sovereign_assets, "rfq-corporate-options.data": self.corporate_options, **values}
         matches = [(key, spec) for key, spec in self.app.callback_map.items() if output_fragment in key and spec.get("callback")]
         self.assertEqual(len(matches), 1)
@@ -88,20 +94,408 @@ class RFQAITests(unittest.TestCase):
                 return {key: match_trade if key == "trade" else value for key, value in component_id.items()}
             return component_id
         output_specs = [{"id": output_id(out.component_id), "property": out.component_property} for out in outputs]
-        response = self.client.post("/_dash-update-component", json={
+        response = (client or self.client).post("/_dash-update-component", json={
             "output": key,
             "outputs": output_specs if isinstance(spec["output"], list) else output_specs[0],
             "inputs": [{**item, "value": values.get(item["id"] + "." + item["property"])} for item in spec["inputs"]],
             "state": [{**item, "value": values.get(item["id"] + "." + item["property"])} for item in spec["state"]],
             "changedPropIds": changed,
         })
-        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        self.assertEqual(response.status_code, expected_status, response.get_data(as_text=True))
+        if expected_status == 204:
+            return None
         return response.json["response"]
 
     def setUp(self):
+        with self.client.session_transaction() as session:
+            session.clear()
         with closing(sqlite3.connect(self.db)) as conn, conn:
             conn.execute("DELETE FROM RFQ")
             conn.execute("DELETE FROM AI_REQUEST_LOG")
+
+    def seed_profile_quotes(self):
+        responses = [
+            {"broker name": "Test Broker", "broker_response": "99", "timestamp": "2026-11-10T10:00"},
+            {"broker name": "Test Broker", "broker_response": "6.20", "timestamp": "2026-11-10T10:01"},
+            {"broker name": "Other Broker", "broker_response": "6.40", "timestamp": "2026-11-10T10:02"},
+            {"broker name": "Inactive Broker", "broker_response": "100", "timestamp": "2026-11-10T10:03"},
+        ]
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.executemany("INSERT INTO RFQ_COUNTERPARTY VALUES (?,?,?)", [
+                ("Sovereign Bond", "Other Broker", 1), ("Corporate Bond", "Other Broker", 1),
+                ("Corporate Bond", "Test Broker", 1), ("Sovereign Bond", "Inactive Broker", 0),
+            ])
+            for number, asset_class, direction, payload, active in [
+                (501, "Sovereign Bond", "Buy", responses, 1),
+                (502, "Sovereign Bond", "Sell", responses, 1),
+                (503, "Corporate Bond", "Buy", responses, 1),
+                (504, "Corporate Bond", "Sell", responses, 1),
+                (505, "Sovereign Bond", "Buy", [], 1),
+                (506, "Sovereign Bond", "Buy", responses, 0),
+            ]:
+                conn.execute('''INSERT INTO RFQ (RFQ_ID,CLASS,DIRECTION,STR_RESPONSE,FL_ACTIVE,DT_INPUT,
+                    REQUESTER,USR_INPUT,TYPE,SEC_NAME,QTY,"LIMIT") VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''',
+                    (number, asset_class, direction, json.dumps(payload), active, "2026-11-10T10:00",
+                     "Trader", "Trader", "Mkt Color", "Test security", 10, 6.3))
+
+        def cleanup():
+            with closing(sqlite3.connect(self.db)) as conn, conn:
+                conn.execute("DELETE FROM RFQ_COUNTERPARTY WHERE NM_COUNTERPARTY IN ('Other Broker','Inactive Broker') OR TP_TRADE='Corporate Bond'")
+        self.addCleanup(cleanup)
+
+    def test_gwm_receives_only_best_quote_for_both_fixed_income_tabs(self):
+        self.seed_profile_quotes()
+        for tab in ("sovereign", "corporate"):
+            response = self.dispatch("rfq-grid.rowData", {
+                "rfq-tabs.value": tab, "rfq-active-switch.checked": True,
+                "current-user.data": {"key_id": 9001, "user": "GWM Test User", "role": "gwm"},
+            }, ["current-user.data", "rfq-tabs.value"])
+            grid = response["rfq-grid"]
+            columns = grid["columnDefs"]
+            quotes = [col for col in columns if col.get("cellRenderer") == "RfqQuoteCell"]
+            self.assertEqual(len(quotes), 1)
+            self.assertEqual(quotes[0]["headerName"], "Best")
+            self.assertFalse(quotes[0]["editable"])
+            self.assertEqual(quotes[0]["cellClassRules"]["rfq-quote-highlight"], "rfqQuoteHighlight(params)")
+            self.assertFalse(any(col["field"].startswith("cp_") for col in columns))
+            for row in grid["rowData"]:
+                expected = "--" if row["rfq_id"] == 505 else "6.40|10:02" if row["direction"] == "Buy" else "6.20|10:01"
+                self.assertEqual(row["best_quote"], expected)
+                self.assertFalse(any(name.startswith("cp_") for name in row))
+            serialized = json.dumps(response)
+            for private in ("Test Broker", "Other Broker", "Inactive Broker", "STR_RESPONSE"):
+                self.assertNotIn(private, serialized)
+
+    def test_traders_keep_counterparty_columns_and_login_changes_refresh_the_view(self):
+        self.seed_profile_quotes()
+        for role in ("trader", "master"):
+            response = self.dispatch("rfq-grid.rowData", {
+                "rfq-tabs.value": "sovereign", "rfq-active-switch.checked": True,
+                "current-user.data": {"user": "Trader", "role": role},
+            }, ["current-user.data"])
+            fields = {col["field"] for col in response["rfq-grid"]["columnDefs"]}
+            self.assertIn(self.page._counterparty_slug("Test Broker"), fields)
+            self.assertIn(self.page._counterparty_slug("Other Broker"), fields)
+            self.assertNotIn("best_quote", fields)
+            actions = next(col for col in response["rfq-grid"]["columnDefs"]
+                           if col.get("field") == "actions")
+            self.assertFalse(actions["cellRendererParams"]["mktColorOnly"])
+        logged_out = self.dispatch("rfq-grid.rowData", {"current-user.data": None}, ["current-user.data"])
+        self.assertEqual(logged_out["rfq-grid"]["rowData"], [])
+
+    def test_gwm_cannot_request_raw_quotes_by_changing_browser_role(self):
+        self.seed_profile_quotes()
+        with self.client.session_transaction() as session:
+            session["user_key_id"] = 9001
+        response = self.dispatch("rfq-grid.rowData", {
+            "rfq-tabs.value": "sovereign", "rfq-active-switch.checked": True,
+            "current-user.data": {"role": "master", "user": "Someone else"},
+        }, ["rfq-tabs.value"])
+        self.assertTrue(all(not key.startswith("cp_") for row in response["rfq-grid"]["rowData"] for key in row))
+        self.assertIn("best_quote", {col["field"] for col in response["rfq-grid"]["columnDefs"]})
+
+    def test_gwm_best_quotes_also_apply_to_closed_rfqs(self):
+        self.seed_profile_quotes()
+        response = self.dispatch("rfq-grid.rowData", {
+            "rfq-tabs.value": "sovereign", "rfq-active-switch.checked": False,
+            "current-user.data": {"user": "GWM Test User", "role": "gwm"},
+        }, ["rfq-active-switch.checked"])
+        self.assertEqual([row["rfq_id"] for row in response["rfq-grid"]["rowData"]], [506])
+        self.assertEqual(response["rfq-grid"]["rowData"][0]["best_quote"], "6.40|10:02")
+
+    def test_gwm_cannot_edit_counterparty_quotes_with_a_direct_callback(self):
+        self.seed_profile_quotes()
+        with closing(sqlite3.connect(self.db)) as conn:
+            before = conn.execute("SELECT STR_RESPONSE FROM RFQ WHERE RFQ_ID=501").fetchone()[0]
+        with self.client.session_transaction() as session:
+            session["user_key_id"] = 9001
+        self.dispatch("rfq-error-notification.message", {
+            "rfq-grid.cellValueChanged": {"colId": self.page._counterparty_slug("Test Broker"),
+                                          "data": {"rfq_id": 501}, "newValue": "7.5|10:45"},
+            "rfq-active-switch.checked": True, "current-user.data": {"role": "trader", "user": "Trader"},
+        }, ["rfq-grid.cellValueChanged"], expected_status=204)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute("SELECT STR_RESPONSE FROM RFQ WHERE RFQ_ID=501").fetchone()[0], before)
+
+    def test_gwm_can_create_rfq_with_authenticated_requester(self):
+        with self.client.session_transaction() as session:
+            session["user_key_id"] = 9001
+        response = self.dispatch("rfq-notification-container.sendNotifications", {
+            **self.sovereign_state([{"direction": "Buy", "bond_name": "LTN",
+                                    "maturity": "LTN 01/01/2028", "quantity": 10}]),
+            "rfq-submit-sovereign.n_clicks": 1, "current-user.data": {"user": "Forged User", "role": "master"},
+        }, ["rfq-submit-sovereign.n_clicks"])
+        self.assertIn("rfq-refresh", response)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute("SELECT REQUESTER, USR_INPUT, TYPE FROM RFQ").fetchone(),
+                             ("GWM Test User", "GWM Test User", "Mkt Color"))
+
+    def test_best_quote_parser_matches_existing_highlight_rules(self):
+        quotes = ["--", "pending", "6.25%|09:00", "6.5|09:01", "Infinity", "1e999"]
+        self.assertEqual(self.page.best_rfq_quote(quotes, "Buy"), "6.5|09:01")
+        self.assertEqual(self.page.best_rfq_quote(quotes, "Sell"), "6.25%|09:00")
+        self.assertEqual(self.page.best_rfq_quote(["pending", "--"], "Buy"), "--")
+        self.assertEqual(self.page.best_rfq_quote(quotes, None), "--")
+        self.assertEqual(self.page.best_rfq_quote(["6.5|09:00", "6.5|10:00"], "Buy"), "6.5|09:00")
+
+    def test_initial_layout_contains_no_quote_data_or_counterparty_names(self):
+        grid = self.page.rfq_components()["rfq-grid"]
+        self.assertEqual(grid.rowData, [])
+        self.assertFalse(any(col["field"].startswith("cp_") for col in grid.columnDefs))
+
+    def test_each_row_contains_ready_to_copy_text_for_the_browser_click(self):
+        self.seed_profile_quotes()
+        for kind in ("Sovereign Bond", "Corporate Bond"):
+            counterparties = self.page.load_counterparties(kind)
+            for best_only in (False, True):
+                rows = self.page.load_rfq_rows(kind, counterparties, best_only=best_only)
+                self.assertTrue(rows)
+                for row in rows:
+                    side = "bid" if row["direction"] == "Sell" else "offer"
+                    self.assertEqual(row["rfq_copy_text"], f"{side} Test security 10q D0")
+                    for name in ("Test Broker", "Other Broker", "Inactive Broker"):
+                        self.assertNotIn(name, row["rfq_copy_text"])
+        components = self.page.rfq_components()
+        self.assertNotIn("rfq-copy-clipboard", components)
+
+    def test_close_action_still_saves_and_copy_is_handled_in_the_browser(self):
+        self.seed_profile_quotes()
+        callback_key = next(key for key, spec in self.app.callback_map.items()
+                            if getattr(spec.get("callback"), "__name__", None) == "handle_rfq_action")
+        self.dispatch(callback_key, {
+            "rfq-grid.cellRendererData": {"value": {"action": "copy", "rfq_id": 501}},
+            "rfq-active-switch.checked": True, "current-user.data": {"user": "Test User"},
+        }, ["rfq-grid.cellRendererData"], expected_status=204)
+        with self.client.session_transaction() as session:
+            session["user_key_id"] = 9002
+        result = self.dispatch(callback_key, {
+            "rfq-grid.cellRendererData": {"value": {"action": "close", "rfq_id": 501}},
+            "rfq-active-switch.checked": True, "current-user.data": {"user": "Forged User"},
+            "rfq-refresh.data": 0,
+        }, ["rfq-grid.cellRendererData"])
+        self.assertEqual(result["rfq-refresh"]["data"], 1)
+        with closing(sqlite3.connect(self.db)) as conn:
+            active, user = conn.execute("SELECT FL_ACTIVE, USR_CLOSED FROM RFQ WHERE RFQ_ID=501").fetchone()
+        self.assertEqual((active, user), (0, "Trader Test User"))
+
+    def test_gwm_has_mkt_color_only_conclude_action_in_every_rfq_tab(self):
+        with self.client.session_transaction() as session:
+            session["user_key_id"] = 9001
+        for tab in ("sovereign", "corporate", "derivatives"):
+            with self.subTest(tab=tab):
+                response = self.dispatch("rfq-grid.rowData", {
+                    "rfq-tabs.value": tab, "rfq-active-switch.checked": True,
+                    "current-user.data": {"user": "Forged User", "role": "master"},
+                }, ["rfq-tabs.value"])
+                actions = next(col for col in response["rfq-grid"]["columnDefs"]
+                               if col.get("field") == "actions")
+                self.assertTrue(actions["cellRendererParams"]["mktColorOnly"])
+
+    def test_signed_users_keep_their_grid_after_a_server_restart(self):
+        self.seed_profile_quotes()
+        path = self.root / ".instance" / "session-secret"
+        with patch.dict(os.environ, {"DASH_SECRET_KEY": ""}), \
+                patch.dict(self.app.server.config, {
+                    "DASHRF_PROFILE_ACCESS": True, "SECRET_KEY": load_session_secret(path),
+                }):
+            for key_id, role in ((9001, "gwm"), (9002, "trader"), (9003, "master")):
+                with self.subTest(role=role):
+                    with self.client.session_transaction() as session:
+                        session["user_key_id"] = key_id
+                    # A restarted server loads the same key and accepts the original cookie.
+                    self.app.server.secret_key = load_session_secret(path)
+                    values = {"current-user.data": {"user": "Browser User", "role": "master"}}
+                    for tab in ("sovereign", "corporate"):
+                        response = self.dispatch("rfq-grid.rowData", {
+                            **values, "rfq-tabs.value": tab, "rfq-active-switch.checked": True,
+                        }, ["rfq-tabs.value"])
+                        self.assertTrue(response["rfq-grid"]["rowData"])
+                        actions = next(col for col in response["rfq-grid"]["columnDefs"]
+                                       if col.get("field") == "actions")
+                        self.assertEqual(actions["cellRendererParams"]["mktColorOnly"], role == "gwm")
+                    auth = self.dispatch("rfq-auth-content.style", values, ["current-user.data"])
+                    self.assertEqual(auth["rfq-auth-content"]["style"], {"display": "block"})
+                    self.assertEqual(auth["rfq-auth-message"]["style"], {"display": "none"})
+
+    def test_expired_session_displays_sign_in_message_instead_of_an_empty_grid(self):
+        with self.client.session_transaction() as session:
+            session["user_key_id"] = 9001
+        with patch.dict(self.app.server.config, {
+            "DASHRF_PROFILE_ACCESS": True, "SECRET_KEY": "a-different-startup-key",
+        }):
+            response = self.dispatch("rfq-auth-content.style", {
+                "current-user.data": {"user": "GWM Test User", "role": "gwm"},
+            }, ["current-user.data"])
+            self.assertEqual(response["rfq-auth-content"]["style"], {"display": "none"})
+            self.assertIn("session has expired", response["rfq-auth-message"]["children"])
+            self.assertEqual(response["rfq-auth-message"]["style"], {"display": "block"})
+
+    def test_gwm_can_conclude_only_stored_mkt_color_type_in_all_asset_classes(self):
+        callback_key = next(key for key, spec in self.app.callback_map.items()
+                            if getattr(spec.get("callback"), "__name__", None) == "handle_rfq_action")
+        with self.client.session_transaction() as session:
+            session["user_key_id"] = 9001
+        for asset_class in ("Sovereign Bond", "Corporate Bond", "Derivatives"):
+            for quote_type in ("Mkt Color", " MKT COLOR ", "Trade", "Live", None, ""):
+                with self.subTest(asset_class=asset_class, quote_type=quote_type):
+                    with closing(sqlite3.connect(self.db)) as conn, conn:
+                        rfq_id = conn.execute(
+                            "INSERT INTO RFQ (CLASS,TYPE,FL_ACTIVE) VALUES (?,?,1)",
+                            (asset_class, quote_type),
+                        ).lastrowid
+                    allowed = str(quote_type or "").strip().lower() == "mkt color"
+                    result = self.dispatch(callback_key, {
+                        "rfq-grid.cellRendererData": {"value": {
+                            "action": "close", "rfq_id": rfq_id, "quote_format": "Mkt Color",
+                        }},
+                        "rfq-active-switch.checked": True,
+                        "current-user.data": {"user": "Forged User", "role": "master"},
+                        "rfq-refresh.data": 0,
+                    }, ["rfq-grid.cellRendererData"], expected_status=200 if allowed else 204)
+                    with closing(sqlite3.connect(self.db)) as conn:
+                        active, user, closed_at = conn.execute(
+                            "SELECT FL_ACTIVE,USR_CLOSED,DT_CLOSED FROM RFQ WHERE RFQ_ID=?", (rfq_id,),
+                        ).fetchone()
+                    if allowed:
+                        self.assertEqual(result["rfq-refresh"]["data"], 1)
+                        self.assertEqual((active, user), (0, "GWM Test User"))
+                        self.assertIsNotNone(closed_at)
+                    else:
+                        self.assertEqual((active, user, closed_at), (1, None, None))
+
+    def test_trader_and_master_can_still_conclude_other_quote_types(self):
+        callback_key = next(key for key, spec in self.app.callback_map.items()
+                            if getattr(spec.get("callback"), "__name__", None) == "handle_rfq_action")
+        for key_id, username in ((9002, "Trader Test User"), (9003, "Master Test User")):
+            with self.client.session_transaction() as session:
+                session["user_key_id"] = key_id
+            for quote_type in ("Mkt Color", "Trade", "Live", None):
+                with self.subTest(username=username, quote_type=quote_type):
+                    with closing(sqlite3.connect(self.db)) as conn, conn:
+                        rfq_id = conn.execute("INSERT INTO RFQ (TYPE,FL_ACTIVE) VALUES (?,1)",
+                                              (quote_type,)).lastrowid
+                    self.dispatch(callback_key, {
+                        "rfq-grid.cellRendererData": {"value": {"action": "close", "rfq_id": rfq_id}},
+                        "rfq-active-switch.checked": True, "rfq-refresh.data": 0,
+                    }, ["rfq-grid.cellRendererData"])
+                    with closing(sqlite3.connect(self.db)) as conn:
+                        self.assertEqual(conn.execute(
+                            "SELECT FL_ACTIVE,USR_CLOSED FROM RFQ WHERE RFQ_ID=?", (rfq_id,),
+                        ).fetchone(), (0, username))
+
+    def test_live_poll_shares_quote_updates_between_signed_users(self):
+        self.seed_profile_quotes()
+        reader = self.app.server.test_client()
+        with reader.session_transaction() as session:
+            session["user_key_id"] = 9001
+        with self.client.session_transaction() as session:
+            session["user_key_id"] = 9003
+        values = {"rfq-live-interval.n_intervals": 1, "rfq-tabs.value": "sovereign",
+                  "rfq-active-switch.checked": True, "rfq-refresh.data": 0,
+                  "current-user.data": {"user": "Forged User", "role": "master"}}
+        before = self.dispatch("rfq-grid.rowData", values, ["rfq-tabs.value"], client=reader)["rfq-grid"]
+        self.dispatch("rfq-error-notification.message", {
+            "rfq-grid.cellValueChanged": {"colId": self.page._counterparty_slug("Test Broker"),
+                                          "data": {"rfq_id": 501}, "newValue": "7.5|10:45"},
+            "rfq-active-switch.checked": True, "rfq-refresh.data": 0,
+        }, ["rfq-grid.cellValueChanged"])
+        response = self.dispatch("rfq-live-snapshot.data", {
+            **values, "rfq-grid.rowData": before["rowData"], "rfq-grid.columnDefs": before["columnDefs"],
+        }, ["rfq-live-interval.n_intervals"], client=reader)
+        self.assertEqual(set(response), {"rfq-live-snapshot"})
+        snapshot = response["rfq-live-snapshot"]["data"]
+        updated = next(row for row in snapshot["rows"] if row["rfq_id"] == 501)
+        self.assertEqual(updated["best_quote"], "7.5|10:45")
+        self.assertNotIn("Test Broker", json.dumps(snapshot))
+        self.assertFalse(any(key.startswith("cp_") for row in snapshot["rows"] for key in row))
+        self.dispatch("rfq-live-snapshot.data", {
+            **values, "rfq-grid.rowData": snapshot["rows"], "rfq-grid.columnDefs": snapshot["columns"],
+        }, ["rfq-live-interval.n_intervals"], expected_status=204, client=reader)
+
+    def test_live_poll_shares_created_and_concluded_rfqs_across_all_tabs(self):
+        reader = self.app.server.test_client()
+        with reader.session_transaction() as session:
+            session["user_key_id"] = 9002
+        with self.client.session_transaction() as session:
+            session["user_key_id"] = 9003
+        forms = {
+            "sovereign": self.sovereign_state([{"direction": "Buy", "bond_name": "LTN",
+                                                 "maturity": "LTN 01/01/2028", "quantity": 10}]),
+            "corporate": self.corporate_state([{"direction": "Sell", "bond_type": "Corporate Bonds",
+                                                 "security": "TEST11", "volume": 5000}]),
+            "derivatives": {"rfq-direction-derivatives.value": "Buy", "rfq-quote-type-derivatives.value": "Trade",
+                            "rfq-bond-name-derivatives.value": "DOL", "rfq-maturity-derivatives.value": 3,
+                            "rfq-maturity-unit-derivatives.value": "M", "rfq-volume-derivatives.value": 1000000,
+                            "rfq-limit-derivatives.value": 0.05, "rfq-strategy-derivatives.value": "Call",
+                            "rfq-strike-solve-derivatives.value": ["solve"], "rfq-barrier-type-derivatives.value": "No Barrier"},
+        }
+        close_key = next(key for key, spec in self.app.callback_map.items()
+                         if getattr(spec.get("callback"), "__name__", None) == "handle_rfq_action")
+        for tab, form in forms.items():
+            with self.subTest(tab=tab):
+                self.dispatch("rfq-notification-container.sendNotifications", {
+                    **form, f"rfq-submit-{tab}.n_clicks": 1, "rfq-refresh.data": 0,
+                }, [f"rfq-submit-{tab}.n_clicks"])
+                values = {"rfq-live-interval.n_intervals": 1, "rfq-tabs.value": tab,
+                          "rfq-active-switch.checked": True, "rfq-refresh.data": 0}
+                snapshot = self.dispatch("rfq-live-snapshot.data", values,
+                                         ["rfq-live-interval.n_intervals"], client=reader)["rfq-live-snapshot"]["data"]
+                self.assertEqual(len(snapshot["rows"]), 1)
+                rfq_id = snapshot["rows"][0]["rfq_id"]
+                self.dispatch(close_key, {
+                    "rfq-grid.cellRendererData": {"value": {"action": "close", "rfq_id": rfq_id}},
+                    "rfq-active-switch.checked": True, "rfq-refresh.data": 0,
+                }, ["rfq-grid.cellRendererData"])
+                closed = self.dispatch("rfq-live-snapshot.data", {
+                    **values, "rfq-grid.rowData": snapshot["rows"], "rfq-grid.columnDefs": snapshot["columns"],
+                }, ["rfq-live-interval.n_intervals"], client=reader)["rfq-live-snapshot"]["data"]
+                self.assertEqual(closed["rows"], [])
+                history = self.dispatch("rfq-live-snapshot.data", {
+                    **values, "rfq-active-switch.checked": False,
+                }, ["rfq-live-interval.n_intervals"], client=reader)["rfq-live-snapshot"]["data"]
+                self.assertEqual([row["rfq_id"] for row in history["rows"]], [rfq_id])
+
+    def test_live_poll_is_disabled_for_guests_and_does_not_control_forms(self):
+        auth = self.dispatch("rfq-auth-content.style", {}, ["current-user.data"])
+        self.assertTrue(auth["rfq-live-interval"]["disabled"])
+        with self.client.session_transaction() as session:
+            session["user_key_id"] = 9001
+        auth = self.dispatch("rfq-auth-content.style", {}, ["current-user.data"])
+        self.assertFalse(auth["rfq-live-interval"]["disabled"])
+        components = self.page.rfq_components()
+        self.assertEqual(components["rfq-live-interval"].interval, 2000)
+        for callback in self.app._callback_list:
+            if any(item["id"] in ("rfq-live-interval", "rfq-live-snapshot") for item in callback["inputs"]):
+                self.assertNotIn(".opened", callback["output"])
+                self.assertNotIn("rfq-refresh.data", callback["output"])
+
+    def test_live_poll_rechecks_profile_changes_and_revocation(self):
+        self.seed_profile_quotes()
+        with self.client.session_transaction() as session:
+            session["user_key_id"] = 9002
+        values = {"rfq-live-interval.n_intervals": 1, "rfq-tabs.value": "sovereign",
+                  "rfq-active-switch.checked": True, "current-user.data": {"role": "master"}}
+        initial = self.dispatch("rfq-grid.rowData", values, ["rfq-tabs.value"])["rfq-grid"]
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("UPDATE USER_KEYS SET ROLE='gwm' WHERE KEY_ID=9002")
+        try:
+            snapshot = self.dispatch("rfq-live-snapshot.data", {
+                **values, "rfq-grid.rowData": initial["rowData"], "rfq-grid.columnDefs": initial["columnDefs"],
+            }, ["rfq-live-interval.n_intervals"])["rfq-live-snapshot"]["data"]
+            self.assertTrue(snapshot["rows"])
+            self.assertTrue(all("best_quote" in row for row in snapshot["rows"]))
+            self.assertNotIn("Test Broker", json.dumps(snapshot))
+            actions = next(col for col in snapshot["columns"] if col.get("field") == "actions")
+            self.assertTrue(actions["cellRendererParams"]["mktColorOnly"])
+            with closing(sqlite3.connect(self.db)) as conn, conn:
+                conn.execute("UPDATE USER_KEYS SET FL_ACTIVE=0 WHERE KEY_ID=9002")
+            revoked = self.dispatch("rfq-live-snapshot.data", {
+                **values, "rfq-grid.rowData": snapshot["rows"], "rfq-grid.columnDefs": snapshot["columns"],
+            }, ["rfq-live-interval.n_intervals"])["rfq-live-snapshot"]["data"]
+            self.assertEqual(revoked["rows"], [])
+        finally:
+            with closing(sqlite3.connect(self.db)) as conn, conn:
+                conn.execute("UPDATE USER_KEYS SET ROLE='trader',FL_ACTIVE=1 WHERE KEY_ID=9002")
 
     def test_schema_removes_legacy_requesters_and_preserves_rfq_history(self):
         with closing(sqlite3.connect(self.db)) as conn, conn:
