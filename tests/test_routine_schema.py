@@ -102,6 +102,19 @@ class RoutineSchemaTests(unittest.TestCase):
                 c.execute("UPDATE UGM_ROUTINE_ACTIVITIES SET DEADLINE_TIME='26:00' WHERE ID_ACTIVITY='NTNB_RUN_1030'")
         self.assertEqual(engine.load_activity('NTNB_RUN','NTNB_RUN_1030')['DEADLINE_TIME'],'10:45')
 
+    def test_existing_five_table_schema_adds_replacement_link_without_rebuilding_logs(self):
+        engine = RoutineService(self.db)
+        engine.ensure_schema()
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute('DROP INDEX idx_routine_successful_replacement')
+            c.execute('ALTER TABLE UGM_ROUTINE_EXECUTIONS DROP COLUMN ID_REPLACED_EXECUTION')
+            c.execute("INSERT INTO UGM_ROUTINE_EXECUTIONS(ID_ROUTINE,ID_ACTIVITY,DT_REF,USERNAME,NM_ACTION,TS_REQUEST,STATUS,INPUT_JSON) VALUES('NTNB_RUN','NTNB_RUN_1030','2026-11-03','Alice','save_quotes','now','PENDING_REVIEW','{}')")
+        engine.ensure_schema()
+        engine.ensure_schema()
+        with closing(sqlite3.connect(self.db)) as c:
+            self.assertEqual(c.execute('SELECT ID_EXECUTION,ID_REPLACED_EXECUTION FROM UGM_ROUTINE_EXECUTIONS').fetchall(), [(1, None)])
+            self.assertEqual(c.execute('PRAGMA foreign_key_check').fetchall(), [])
+
 
 if __name__=='__main__':
     unittest.main()

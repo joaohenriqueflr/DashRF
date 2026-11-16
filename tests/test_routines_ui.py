@@ -218,6 +218,81 @@ class RoutinesUITests(unittest.TestCase):
         self.assertEqual(self.page.service().get_execution(execution["ID_EXECUTION"], "Alice")["STATUS"], "CANCELLED")
         self.assertEqual(self.quote_rows(), [])
 
+    def test_completed_activity_can_be_replaced_after_explicit_confirmation(self):
+        first = self.prepare()
+        self.card_action(first)
+        second = self.prepare()
+        self.assertEqual(second['ID_REPLACED_EXECUTION'], first['ID_EXECUTION'])
+        self.assertEqual(len(self.quote_rows()), 2)
+        rendered = json.dumps(self.dispatch('routine-chat.children'), ensure_ascii=False)
+        self.assertIn('Deseja excluir', rendered)
+        self.assertIn('Confirmar substituição', rendered)
+        self.card_action(second, cancel=True)
+        self.assertEqual(len(self.quote_rows()), 2)
+        cancelled_card = json.dumps(self.page.review_card(self.page.service().get_execution(second['ID_EXECUTION'], 'Alice')).to_plotly_json(), default=lambda obj: obj.to_plotly_json(), ensure_ascii=False)
+        self.assertIn('Dados anteriores mantidos', cancelled_card)
+        self.assertNotIn('Dados anteriores substituídos', cancelled_card)
+        third = self.prepare()
+        rows = [{**third['INPUT_JSON']['rows'][0], 'TX_QUOTE': 0.08}]
+        self.card_action(third, rows=rows)
+        self.assertEqual(self.quote_rows(), [('Bid', 0.08)])
+        snapshot = self.page.service().get_daily_quote_runs('NTNB_RUN')
+        self.assertEqual(snapshot['summary']['run_count'], 1)
+        rendered = json.dumps(self.dispatch('routine-chat.children'), ensure_ascii=False)
+        self.assertIn('Dados substituídos pela run', rendered)
+
+    def test_credit_import_replacement_uses_shared_confirmation_card(self):
+        first = self.prepare(upload=True)
+        self.card_action(first)
+        second = self.prepare(upload=True)
+        rendered = json.dumps(self.dispatch('routine-chat.children', {'routine-selected.data': 'CREDIT_RUN'}), ensure_ascii=False)
+        self.assertIn('Confirmar substituição', rendered)
+        self.assertIn('Deseja excluir', rendered)
+        self.assertEqual(len(self.quote_rows()), 2)
+        self.card_action(second, rows=[{**second['INPUT_JSON']['rows'][0], 'TX_QUOTE': 0.11}])
+        self.assertEqual(self.quote_rows(), [('Bid', 0.11)])
+
+    def test_debtor_correction_card_edits_all_proposed_fields_after_activity_completion(self):
+        engine = self.page.service()
+        original = engine.prepare_action('DEBTORS', 'Alice', 'import_debtors', {'rows': [
+            {'ID_CLIENT': '00123', 'NR_DAYS': 2, 'NM_RESP_GWM': 'Old', 'DESCR': 'Original case'}]})
+        self.card_action(original)
+        correction = engine.prepare_action('DEBTORS', 'Alice', 'update_debtor', {
+            'client_id': '00123', 'new_client_id': '00124', 'nr_days': 3, 'responsible': 'New',
+            'case_description': 'Correction', 'resolved': True})
+        card = self.page.review_card(correction)
+        rendered = json.dumps(card.to_plotly_json(), default=lambda obj: obj.to_plotly_json(), ensure_ascii=False)
+        self.assertIn('Confirmar alteração', rendered)
+        self.assertIn('Valores atuais', rendered)
+        grid = next(child for child in card.children if getattr(child, 'id', None) == {'type': 'routine-card-grid', 'execution': correction['ID_EXECUTION']})
+        editable = {col['field']: col['editable'] for col in grid.columnDefs}
+        self.assertFalse(editable['client_id'])
+        self.assertTrue(all(editable[key] for key in ('new_client_id', 'nr_days', 'responsible', 'case_description', 'resolved')))
+        self.card_action(correction, rows=[{**correction['INPUT_JSON'], 'nr_days': 4}])
+        with closing(sqlite3.connect(self.db)) as c:
+            self.assertEqual(c.execute('SELECT ID_CLIENT,NR_DAYS,NM_RESP_GWM,DESCR,FL_RESOLVED FROM UGM_ROUTINES_DEVEDORES').fetchall(),
+                             [('00124', 4, 'New', 'Correction', 0)])
+        self.assertEqual(engine.get_activity_completion('DEBTORS', 'DEBTORS:DEFAULT')['ID_EXECUTION'], original['ID_EXECUTION'])
+
+    def test_debtor_upload_replacement_asks_and_waits_for_confirmation(self):
+        text = 'ID_CLIENT\tNR_DAYS\tNM_RESP_GWM\tDESCR\n00123\t2\tGWM\tOriginal\n'
+        values = {'routine-selected.data': 'DEBTORS', 'routine-prepare.n_clicks': 1,
+                  'routine-import-text.value': text, 'routine-source.value': None}
+        self.dispatch('routine-chat-feedback.children', values, ['routine-prepare.n_clicks'])
+        engine = self.page.service()
+        first = engine.get_routine_executions('DEBTORS')[-1]
+        self.card_action(first)
+        values['routine-import-text.value'] = text.replace('Original', 'Corrected')
+        self.dispatch('routine-chat-feedback.children', values, ['routine-prepare.n_clicks'])
+        second = engine.get_routine_executions('DEBTORS')[-1]
+        self.assertEqual(second['ID_REPLACED_EXECUTION'], first['ID_EXECUTION'])
+        rendered = json.dumps(self.dispatch('routine-chat.children', {'routine-selected.data': 'DEBTORS'}), ensure_ascii=False)
+        self.assertIn('Confirmar substituição', rendered)
+        self.assertIn('Original', rendered)
+        self.card_action(second)
+        with closing(sqlite3.connect(self.db)) as c:
+            self.assertEqual(c.execute('SELECT DESCR FROM UGM_ROUTINES_DEVEDORES').fetchall(), [('Corrected',)])
+
     def test_button_cannot_confirm_another_cards_state(self):
         first, second = self.prepare(), self.prepare()
         execution_id = first["ID_EXECUTION"]

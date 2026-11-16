@@ -43,15 +43,62 @@ Install the SDK in the environment that runs `app.py`:
 python -m pip install -r requirements-ai.txt
 ```
 
-Set `OPENAI_API_KEY` in the server environment, then restart the app. `.env` files
-are ignored by Git but are not automatically loaded. Keep the key outside source
-control and out of browser-side code.
+The client automatically reads `.env` from the project root, independently of
+the working directory. This local file is ignored by Git. `.env.example` is the
+shareable template and must contain only placeholders. Keep internal URLs and
+personal keys in `.env`; do not put them in `.gitignore` itself. Process environment
+variables override file values, including empty values. Restart the app after
+changing settings, which are cached per service instance.
+
+| Setting | Purpose |
+| --- | --- |
+| `UBS_BROKER_URL` | Internal AIaaS authentication broker URL |
+| `UBS_OPENAI_BASE_URL` | Internal gateway base URL, including its AIaaS API path |
+| `UBS_BROKER_VERSION` | Broker version; an empty string reproduces the supplied script |
+| `UBS_SSL_VERIFY` | `true` (default) or `false`, applied only to the UBS gateway HTTP client |
+| `OPENAI_API_KEY` | Personal OpenAI API key used as fallback |
+
+UBS is always tried first when either UBS URL is configured. Both URLs must be
+present for UBS authentication. The client injects system certificate trust using
+`truststore`, creates `aiaas_auth.AzureAuthClient` with `AuthMode.DEVPOD`, and obtains
+`authenticate_broker().access_token` before each operation. That token authenticates
+the standard `OpenAI` client against the configured gateway. Install `aiaas_auth`
+from the UBS-approved internal package source in the work environment; it is not
+needed at home. The UBS path requires Python 3.10+ for `truststore`.
+No `AzureOpenAI`, `DefaultAzureCredential`, Azure endpoint variable,
+or API-version setting is used by this broker flow.
+
+If the broker cannot initialize or authenticate (including missing work-only
+dependencies or an unavailable work network), the client uses the personal key.
+Connection/time-out failures and gateway HTTP 401, 403, 408, 429 or 5xx responses
+also allow one personal fallback attempt. The failed UBS API attempt and the
+personal attempt each have their own committed audit record. Invalid model output,
+refusals, other HTTP errors and audit persistence failures do not trigger fallback.
+The next operation tries UBS again, even after a previous fallback.
+
+The personal client always targets `https://api.openai.com/v1`, retains TLS
+verification, and ignores `OPENAI_BASE_URL` so the personal key cannot accidentally
+be sent to the corporate gateway. Internal URLs, broker tokens and API keys are
+not included in audit request bodies or application log messages. If both UBS
+and the personal fallback are unavailable, the request fails with a sanitized
+error. Leave `OPENAI_API_KEY` empty to disable personal fallback.
+
+The locally supplied UBS configuration uses `UBS_SSL_VERIFY=false` to reproduce
+the example script. Set it to `true` when the gateway certificate is trusted by
+the system certificate store. The broker still uses the system certificate trust.
+At home, filling in `OPENAI_API_KEY` is sufficient; the optional UBS packages are
+imported only when attempting UBS authentication. Both providers use the prompt's
+SQLite `MODEL` value, so choose a model identifier accepted by both environments
+when using fallback. The broker version and Responses API support must be checked
+in the work environment. See the official
+[OpenAI Python SDK configuration](https://developers.openai.com/api/reference/python).
 
 **The prompt and model both come from SQLite.** There is no Python default prompt,
 no model fallback, and no `OPENAI_MODEL` override. A missing active prompt, empty
 instructions, or empty model prevents the AI call and displays an unavailable
-message. Requests are stateless, have no tools or automatic retries, and use a
-45-second timeout with `store=False`.
+message. RFQ requests are stateless and have no tools. SDK retries are disabled;
+only the UBS-to-personal fallback described above may make a second API attempt.
+Model API calls use a 45-second timeout with `store=False`.
 
 ## SQLite prompt configuration
 

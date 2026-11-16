@@ -130,9 +130,9 @@ class AIServiceTests(unittest.TestCase):
             self.assertEqual(conn.execute('SELECT "COMMENT" FROM AI_PROMPTS WHERE PROMPT_ID=?', (first.id,)).fetchone()[0], note)
 
     def test_missing_api_key_is_a_configuration_error(self):
-        with patch.dict(os.environ, {"OPENAI_API_KEY": ""}):
+        with patch.dict(os.environ, {"OPENAI_API_KEY": ""}, clear=True):
             with self.assertRaises(AIConfigurationError):
-                OpenAIService(database_path=self.db)._get_client()
+                OpenAIService(database_path=self.db, config_path=Path(self.temp.name) / ".env")._get_client()
 
     def test_validation_status_preserves_existing_model_failure_and_usage(self):
         audit = AIRequestLog(self.db)

@@ -59,6 +59,7 @@ TABLES = {
         INPUT_JSON TEXT NOT NULL,
         RESULT_JSON TEXT,
         ERROR_MESSAGE TEXT,
+        ID_REPLACED_EXECUTION INTEGER REFERENCES UGM_ROUTINE_EXECUTIONS(ID_EXECUTION),
         FOREIGN KEY(ID_ROUTINE,ID_ACTIVITY) REFERENCES UGM_ROUTINE_ACTIVITIES(ID_ROUTINE,ID_ACTIVITY))""",
     "UGM_ROUTINE_CHAT": """(
         ID_MESSAGE INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -121,6 +122,9 @@ def _indexes(conn):
     conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_activity_daily_completion
         ON UGM_ROUTINE_EXECUTIONS(ID_ACTIVITY,DT_REF)
         WHERE STATUS='SUCCESS' AND FL_COMPLETES_ACTIVITY=1""")
+    conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_routine_successful_replacement
+        ON UGM_ROUTINE_EXECUTIONS(ID_REPLACED_EXECUTION)
+        WHERE STATUS='SUCCESS' AND ID_REPLACED_EXECUTION IS NOT NULL""")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_activity_executions_day ON UGM_ROUTINE_EXECUTIONS(ID_ACTIVITY,DT_REF,ID_EXECUTION)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_routine_executions_day ON UGM_ROUTINE_EXECUTIONS(ID_ROUTINE,DT_REF)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_activity_chat_day ON UGM_ROUTINE_CHAT(ID_ACTIVITY,USERNAME,DT_REF,ID_MESSAGE)")
@@ -157,6 +161,8 @@ def _seed(conn):
             for tool in tools:
                 _insert(conn, 'UGM_ROUTINE_ACTIVITY_TOOLS', dict(ID_ACTIVITY=activity,NM_TOOL=tool,
                     REVIEW_POLICY='CONFIRM' if routine_tools.get_tool(tool).write else 'AUTO'))
+    from services.routine_catalog import install_import_catalog
+    install_import_catalog(conn)
 
 
 def _migrate_current_schema(conn):
@@ -250,6 +256,9 @@ def ensure_routine_schema(database_path):
                 _migrate_current_schema(conn)
             for name,ddl in TABLES.items():
                 conn.execute(f'CREATE TABLE IF NOT EXISTS {name} {ddl}')
+            execution_columns = {row[1] for row in conn.execute('PRAGMA table_info(UGM_ROUTINE_EXECUTIONS)')}
+            if 'ID_REPLACED_EXECUTION' not in execution_columns:
+                conn.execute('ALTER TABLE UGM_ROUTINE_EXECUTIONS ADD COLUMN ID_REPLACED_EXECUTION INTEGER REFERENCES UGM_ROUTINE_EXECUTIONS(ID_EXECUTION)')
             _indexes(conn)
             if not conn.execute('SELECT 1 FROM UGM_ROUTINES LIMIT 1').fetchone():
                 _seed(conn)

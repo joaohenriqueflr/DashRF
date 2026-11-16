@@ -50,6 +50,11 @@
 .routine-workspace-import > .routine-timeline-panel { grid-column: 2; grid-row: 1; position: sticky; top: 20px; max-height: calc(100vh - 40px); overflow-y: auto; }
 .routine-workspace-import .routine-chat { height: 390px; }
 .routine-workspace-import .routine-textarea { min-height: 140px; }
+.routine-staged-preview { display: flex; flex-direction: column; gap: 14px; box-shadow: none; background: #fbfcfe; }
+.routine-preview-flow { display: grid; gap: 10px; padding-left: 22px; margin: 0; color: #475569; font-size: 13px; }
+.routine-preview-empty { padding: 25px 16px; border: 1px dashed #cbd5e1; border-radius: 10px; text-align: center; color: #64748b; background: #fff; font-size: 12px; }
+.routine-staged-preview button { align-self: flex-start; }
+.routine-staged-preview button:disabled { opacity: .45; cursor: not-allowed; }
 .routine-eyebrow { color: #94a3b8; font-size: 9px; letter-spacing: .12em; font-weight: 700; margin-bottom: 7px; }
 .routine-timeline-vertical { display: flex; flex-direction: column; gap: 0; }
 .routine-step-vertical { position: relative; display: grid; grid-template-columns: 25px minmax(0, 1fr); align-items: start; gap: 12px; flex: none; width: 100%; background: transparent; border: 0; border-radius: 0; padding: 0 0 24px; }

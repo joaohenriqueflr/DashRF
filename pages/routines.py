@@ -86,7 +86,7 @@ def _grid_columns(rows, *, editable=False, update=False):
     return [{
         "field": key, "headerName": key, "minWidth": 145,
         "editable": editable and key not in {"ID_SECURITY", "TX_DI_REF", "TX_SPREAD"}
-                    and (not update or key in {"description", "resolved"}),
+                    and (not update or key in {"description", "resolved", "nr_days", "responsible", "case_description", "new_client_id"}),
         **({"checkboxSelection": True, "headerCheckboxSelection": True} if index == 0 and editable else {}),
     } for index, key in enumerate(fields)]
 
@@ -203,6 +203,7 @@ def review_card(execution):
     args = _json(execution.get("INPUT_JSON"))
     preview = _json(execution.get("RESULT_JSON"))
     pending = execution["STATUS"] == "PENDING_REVIEW"
+    replacement = preview.get("replacement")
     update = preview.get("kind") == "update"
     importing = "rows" in args
     rows = args.get("rows") if pending and importing else preview.get("rows", [])
@@ -227,6 +228,16 @@ def review_card(execution):
                      html.Pre(json.dumps(preview["current"], ensure_ascii=False, indent=2), className="routine-pre")]
     if preview.get("warnings"):
         elements.append(html.Div(" · ".join(map(str, preview["warnings"])), className="routine-warning"))
+    if replacement:
+        replacement_text = ("Excluir os dados anteriores desta atividade e inserir a tabela abaixo? Cancelar mantém os dados anteriores." if pending else
+                            "Dados anteriores substituídos." if execution['STATUS'] == 'SUCCESS' else "Dados anteriores mantidos.")
+        elements.append(html.Div(
+            f"Substituição da execução #{replacement['execution_id']} · {replacement['activity_name']} · {replacement['date']}. {replacement_text}",
+            className="routine-warning" if pending else "routine-muted",
+        ))
+    if execution.get("REPLACED_BY_EXECUTION"):
+        noun = 'run' if execution['NM_ACTION'] == 'save_quotes' else 'execução'
+        elements.append(html.Div(f"Dados substituídos pela {noun} #{execution['REPLACED_BY_EXECUTION']}.", className="routine-muted"))
     if preview.get("text"):
         elements.append(html.Pre(str(preview["text"]), className="routine-pre"))
     if preview.get("body"):
@@ -234,7 +245,7 @@ def review_card(execution):
                      html.Pre(str(preview["body"]), className="routine-pre")]
     if pending:
         elements.append(html.Div(
-            "Revise os valores. Somente o clique em Confirmar efetiva esta proposta.",
+            "Revise os valores. Somente o clique no botão de confirmação efetiva esta proposta.",
             className="routine-muted",
         ))
     if rows or pending:
@@ -251,7 +262,7 @@ def review_card(execution):
     if pending:
         elements += [
             html.Div([
-                html.Button("Confirmar", id={"type": "routine-card-confirm", "execution": execution_id},
+                html.Button("Confirmar substituição" if replacement else "Confirmar alteração" if update else "Confirmar", id={"type": "routine-card-confirm", "execution": execution_id},
                             n_clicks=0, className="routine-primary", type="button"),
                 html.Button("Excluir linhas selecionadas", id={"type": "routine-card-delete", "execution": execution_id},
                             n_clicks=0, className="routine-secondary", type="button", disabled=not importing),
@@ -291,6 +302,19 @@ def _transcript(history, executions, *, quote_import=False):
         "Sua conversa começa aqui. O histórico é individual e reinicia a cada dia; os dados operacionais são compartilhados.",
         className="routine-empty",
     )]
+
+
+def _staged_import_preview(activity):
+    return html.Div([
+        html.Div([html.Strong('Prévia da importação'), html.Span('Em preparação', className='routine-card-badge')],
+                 className='routine-card-heading'),
+        html.P('O formato da tabela e as regras de importação serão definidos na próxima etapa.', className='routine-muted'),
+        html.Ol([html.Li('Você fornece a tabela.'), html.Li('O assistente interpreta e organiza as informações.'),
+                 html.Li('Você revisa a prévia e autoriza a importação.')], className='routine-preview-flow'),
+        html.Div('Os dados organizados para revisão aparecerão aqui.', className='routine-preview-empty'),
+        html.Button('Confirmar importação', type='button', disabled=True, className='routine-primary'),
+        html.Small('Disponível após a definição do formato e das validações.', className='routine-muted'),
+    ], className='routine-review-card routine-staged-preview', **{'aria-label': 'Prévia da atividade ' + activity['NM_ACTIVITY']})
 
 
 def _timeline(steps, *, allow_manual=True):
@@ -343,6 +367,7 @@ def layout(routine=None, activity=None, **_query):
     activity_ids = {item["ID_ACTIVITY"] for item in engine.list_activities(selected)} if selected else set()
     initial_activity = {"routine": selected, "activity": activity} if activity in activity_ids else None
     initial_quote_import = bool(initial_activity and engine.is_quote_import(selected, activity))
+    initial_table_import = bool(initial_activity and engine.is_table_import(selected, activity))
     groups = {}
     for routine in routines:
         group = routine["NM_GROUP"]
@@ -381,7 +406,7 @@ def layout(routine=None, activity=None, **_query):
                 html.Div("Selecione uma atividade no menu à esquerda para começar.",
                          id="routine-activity-empty", className="routine-panel routine-activity-empty"),
                 html.Div(id="routine-activity-content", style={} if initial_activity else {"display": "none"}, children=[
-                    html.Div(id="routine-workspace", className="routine-workspace routine-workspace-import" if initial_quote_import else "routine-workspace", children=[
+                    html.Div(id="routine-workspace", className="routine-workspace routine-workspace-import" if initial_table_import else "routine-workspace", children=[
                         html.Section(className="routine-panel routine-chat-panel", children=[
                             html.H5("Importar run" if initial_quote_import else "Seu chat", id="routine-chat-heading"),
                             html.P(id="routine-chat-hint", className="routine-muted"),
@@ -397,11 +422,11 @@ def layout(routine=None, activity=None, **_query):
                         html.Section(id="routine-timeline-panel", className="routine-panel routine-timeline-panel", children=[
                             html.Div("ACOMPANHAMENTO", className="routine-eyebrow"),
                             html.H5("Atividade selecionada", id="routine-timeline-title"),
-                            html.Div(id="routine-timeline", className="routine-timeline routine-timeline-vertical" if initial_quote_import else "routine-timeline"),
+                            html.Div(id="routine-timeline", className="routine-timeline routine-timeline-vertical" if initial_table_import else "routine-timeline"),
                             html.Div(id="routine-timeline-feedback", role="status"),
                         ]),
                         html.Section(id="routine-import-panel", className="routine-panel routine-import-panel",
-                                     style={"display": "none"} if initial_quote_import else {}, children=[
+                                     style={"display": "none"} if initial_table_import else {}, children=[
                             html.H5("Importar dados"),
                             html.Label("Fonte", htmlFor="routine-source"),
                             dcc.Dropdown(id="routine-source", clearable=False),
@@ -437,7 +462,7 @@ def layout(routine=None, activity=None, **_query):
                                    className="ag-theme-alpine routine-quote-grid", style={"height": "350px"}),
                     ]),
                     html.Section(id="routine-data-panel", className="routine-panel",
-                                 style={"display": "none"} if initial_quote_import else {}, children=[
+                                 style={"display": "none"} if initial_table_import else {}, children=[
                         html.H5("Dados compartilhados do dia"),
                         html.Div(id="routine-data-feedback", className="routine-muted"),
                         dag.AgGrid(id="routine-data", rowData=[], columnDefs=[],
@@ -556,6 +581,8 @@ def load_routine_view(routine_id, current_user, _view_key, selection):
                 "routine-workspace", {"display": "none"}, {"display": "none"}, "Seu chat", "", "Selecione uma atividade…",
                 {"display": "none"}, "routine-timeline", "Etapas do dia", "", {"display": "none"}, {})
     quote_import = engine.is_quote_import(routine_id, activity_id)
+    table_import = engine.is_table_import(routine_id, activity_id)
+    staged = engine._is_staged(routine)
     debtors = routine["LAYOUT_KEY"] == "debtors"
     sources = ["Tabela manual"] if debtors else _json(routine.get("CONFIG_JSON")).get("sources", [])
     tools = {item["NM_TOOL"] for item in engine.load_routine_tools(routine_id, activity_id)}
@@ -564,11 +591,15 @@ def load_routine_view(routine_id, current_user, _view_key, selection):
         engine.load_prompt(routine_id, activity_id)
     except (LookupError, ValueError, AIError) as exc:
         warnings.append(str(exc))
-    if routine_id == "NTNF_RUN":
+    if staged:
+        warnings.append('Em preparação · formato e destino dos dados a definir.')
+    elif routine_id == "NTNF_RUN":
         warnings.append("A gravação NTN-F depende da curva DI Bloomberg e da convenção de composição configuradas no backend.")
     hint = ("CSV, TSV e Excel com os nomes de colunas do contrato são lidos sem IA. "
             "Texto livre ou e-mail é interpretado pelo assistente. Revise o card antes de gravar.")
-    if not debtors:
+    if staged:
+        hint = 'O formato da tabela, as validações e o destino dos dados serão definidos na próxima etapa.'
+    elif not debtors:
         hint += " TX_QUOTE é uma taxa decimal: 0,07 corresponde a 7%."
         hint += " Colunas: NM_SECURITY, SIDE (Bid/Ask), TX_QUOTE; opcionais: VL_QUOTE e TS_REF."
         if routine_id == "NTNF_RUN":
@@ -578,14 +609,16 @@ def load_routine_view(routine_id, current_user, _view_key, selection):
     return (routine["NM_ROUTINE"], routine["DS_ACTIVITY"] or routine["DS_ROUTINE"], [{"label": source, "value": source} for source in sources],
             sources[0] if sources else None,
             hint, {"display": "inline-block"} if debtors and "debtor_report" in tools else {"display": "none"}, " · ".join(warnings),
-            "routine-workspace routine-workspace-import" if quote_import else "routine-workspace",
-            {"display": "none"} if quote_import or not tools.intersection({"save_quotes", "import_debtors"}) else {},
-            {"display": "none"} if quote_import or not tools.intersection({"query_quotes", "query_debtors"}) else {},
-            "Importar run" if quote_import else "Seu chat",
-            "Cole a tabela da run XP. Revise as cotações no card e confirme a importação." if quote_import else "",
-            "Cole aqui a tabela da run XP…" if quote_import else "Converse com o assistente desta rotina…",
+            "routine-workspace routine-workspace-import" if table_import else "routine-workspace",
+            {"display": "none"} if table_import or not tools.intersection({"save_quotes", "import_debtors"}) else {},
+            {"display": "none"} if table_import or not tools.intersection({"query_quotes", "query_debtors"}) else {},
+            routine['NM_ACTIVITY'] if staged else "Importar run" if quote_import else "Seu chat",
+            ("Em preparação. O envio de tabelas será habilitado após a definição do formato. "
+             + ('Horário inicial: 10h30. Poderá repetir durante o dia e substituir a cotação anterior após confirmação.' if routine['CONFIG_JSON'].get('repeatable') else ''))
+                if staged else "Cole a tabela da run XP. Revise as cotações no card e confirme a importação." if quote_import else "",
+            "Esta atividade está em preparação. Consulte o fluxo previsto…" if staged else "Cole aqui a tabela da run XP…" if quote_import else "Converse com o assistente desta rotina…",
             {} if quote_import else {"display": "none"},
-            "routine-timeline routine-timeline-vertical" if quote_import else "routine-timeline",
+            "routine-timeline routine-timeline-vertical" if table_import else "routine-timeline",
             "Atividade selecionada",
             routine["NM_ACTIVITY"], {}, {"display": "none"})
 
@@ -607,7 +640,7 @@ def refresh_shared_routine(_interval, routine_id, current_user, _refresh, select
     engine = service()
     try:
         quote_import = engine.is_quote_import(routine_id, activity_id)
-        timeline = _timeline(engine.get_routine_timeline(routine_id, activity_id=activity_id), allow_manual=not quote_import)
+        timeline = _timeline(engine.get_routine_timeline(routine_id, activity_id=activity_id), allow_manual=not engine.is_table_import(routine_id, activity_id))
         if quote_import:
             snapshot = engine.get_daily_quote_runs(routine_id)
             rows = snapshot.get("rows", [])
@@ -636,8 +669,12 @@ def load_routine_chat(routine_id, current_user, _refresh, _view_key, selection):
     try:
         engine = service()
         username = _username(current_user)
-        return _transcript(engine.load_chat_history(routine_id, username, activity_id=activity_id),
-                           engine.get_routine_executions(routine_id, username=username, activity_id=activity_id),
+        history = engine.load_chat_history(routine_id, username, activity_id=activity_id)
+        executions = engine.get_routine_executions(routine_id, username=username, activity_id=activity_id)
+        activity = engine.load_activity(routine_id, activity_id)
+        if engine._is_staged(activity):
+            return [_staged_import_preview(activity), *(_transcript(history, executions) if history or executions else [])]
+        return _transcript(history, executions,
                            quote_import=engine.is_quote_import(routine_id, activity_id))
     except Exception as exc:
         return html.Div(_error(exc), className="routine-warning")
@@ -793,7 +830,7 @@ def review_routine_action(confirm, cancel, rows, card_id, routine_id, current_us
         if result["STATUS"] == "FAILED":
             return result.get("ERROR_MESSAGE") or "A operação falhou.", True, True, notice
         if result["STATUS"] == "PENDING_REVIEW":
-            return "As taxas calculadas mudaram. Revise o card atualizado e confirme novamente.", False, False, notice
+            return "Os dados mudaram. Revise o card atualizado e confirme novamente.", False, False, notice
         return "Operação concluída.", True, True, notice
     except Exception as exc:
         return _error(exc), False, False, no_update

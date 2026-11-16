@@ -10,6 +10,7 @@ from services.ai_audit import AIRequestLog
 
 logger = logging.getLogger(__name__)
 DEFAULT_DATABASE_PATH = Path(__file__).resolve().parents[1] / "data" / "fixed_income.db"
+DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / ".env"
 
 
 class AIError(Exception):
@@ -29,7 +30,7 @@ class AIError(Exception):
 
 
 class AIConfigurationError(AIError):
-    """The SDK, API key, or prompt configuration is missing."""
+    """The SDK, authentication, or prompt configuration is missing or invalid."""
 
 
 @dataclass(frozen=True)
@@ -110,20 +111,110 @@ def _request_context(prompt, payload, items, audit_context):
 
 
 class OpenAIService:
-    def __init__(self, *, client=None, database_path=None):
+    def __init__(self, *, client=None, database_path=None, config_path=None):
         self._client = client
+        self._injected_client = client is not None
+        self._provider = None
+        self._settings = None
+        self._ubs_auth = None
+        self._ubs_client = None
+        self._personal_client = None
+        self.config_path = Path(config_path) if config_path is not None else DEFAULT_CONFIG_PATH
         self.database_path = Path(database_path) if database_path is not None else DEFAULT_DATABASE_PATH
 
-    def _get_client(self):
-        if self._client is None:
-            if not os.environ.get("OPENAI_API_KEY"):
-                raise AIConfigurationError("OPENAI_API_KEY is not configured.")
+    def _load_settings(self):
+        if self._settings is None:
+            settings = {}
+            if self.config_path.is_file():
+                try:
+                    from dotenv import dotenv_values
+                    settings = dotenv_values(self.config_path, interpolate=False)
+                except Exception as exc:
+                    raise AIConfigurationError("Unable to read .env. Install requirements-ai.txt and check the local configuration.") from exc
+            # Explicit process settings override the local file, including empty values.
+            self._settings = {**settings, **os.environ}
+        return self._settings
+
+    def _get_ubs_client(self, settings):
+        broker_url = (settings.get("UBS_BROKER_URL") or "").strip()
+        base_url = (settings.get("UBS_OPENAI_BASE_URL") or "").strip()
+        if not broker_url or not base_url:
+            raise AIConfigurationError("Configure both UBS_BROKER_URL and UBS_OPENAI_BASE_URL in .env.")
+        verify = (settings.get("UBS_SSL_VERIFY") or "true").strip().lower()
+        if verify not in {"true", "false"}:
+            raise AIConfigurationError("UBS_SSL_VERIFY must be true or false.")
+        # Load system certificates before importing the broker and HTTP transport.
+        import truststore
+        truststore.inject_into_ssl()
+        import httpx
+        from openai import OpenAI
+        from aiaas_auth import AuthMode, AzureAuthClient
+
+        if self._ubs_auth is None:
+            self._ubs_auth = AzureAuthClient(
+                broker_url=broker_url, mode=AuthMode.DEVPOD,
+                broker_version=settings.get("UBS_BROKER_VERSION") or "",
+            )
+        # Ask the broker for a current token for every operation, including reused services.
+        token = self._ubs_auth.authenticate_broker().access_token
+        if not isinstance(token, str) or not token.strip():
+            raise AIConfigurationError("The UBS broker did not return an access token.")
+        if self._ubs_client is None:
+            http_client = httpx.Client(verify=verify == "true", timeout=45.0)
+            try:
+                self._ubs_client = OpenAI(
+                    base_url=base_url, api_key=token, http_client=http_client,
+                    timeout=45.0, max_retries=0,
+                )
+            except Exception:
+                http_client.close()
+                raise
+        else:
+            self._ubs_client.api_key = token
+        return self._ubs_client
+
+    def _get_personal_client(self, settings):
+        api_key = (settings.get("OPENAI_API_KEY") or "").strip()
+        if not api_key:
+            raise AIConfigurationError("UBS authentication is unavailable and OPENAI_API_KEY is not configured for fallback.")
+        if self._personal_client is None:
             try:
                 from openai import OpenAI
+                # Explicit destination prevents OPENAI_BASE_URL redirecting the personal key.
+                self._personal_client = OpenAI(
+                    base_url="https://api.openai.com/v1", api_key=api_key,
+                    timeout=45.0, max_retries=0,
+                )
             except ImportError as exc:
                 raise AIConfigurationError("Install requirements-ai.txt in the app environment.") from exc
-            self._client = OpenAI(timeout=45.0, max_retries=0)
+            except Exception as exc:
+                raise AIConfigurationError("Unable to initialize the personal OpenAI client.") from exc
+        return self._personal_client
+
+    def _get_client(self, *, personal=False):
+        if self._injected_client:
+            return self._client
+        settings = self._load_settings()
+        if not personal and (settings.get("UBS_BROKER_URL") or settings.get("UBS_OPENAI_BASE_URL")):
+            try:
+                self._client = self._get_ubs_client(settings)
+                self._provider = "ubs"
+                return self._client
+            except Exception as exc:
+                if not (settings.get("OPENAI_API_KEY") or "").strip():
+                    raise AIConfigurationError("UBS authentication is unavailable. Check the broker configuration, network and aiaas_auth installation.") from exc
+                logger.warning("UBS authentication unavailable; using personal OpenAI fallback.")
+        self._client = self._get_personal_client(settings)
+        self._provider = "personal"
         return self._client
+
+    def _can_fallback(self, error):
+        if self._provider != "ubs" or not (self._load_settings().get("OPENAI_API_KEY") or "").strip():
+            return False
+        from openai import APIConnectionError, APIStatusError
+        return (isinstance(error, APIConnectionError)
+                or isinstance(error, APIStatusError) and (
+                    error.status_code in {401, 403, 408, 429} or error.status_code >= 500))
 
     @staticmethod
     def _validate_prompt(prompt):
@@ -150,18 +241,21 @@ class OpenAIService:
                           response_id=getattr(source, "response_id", None), model=getattr(source, "model", None),
                           **{name: getattr(source, name, None) for name in ("input_tokens", "output_tokens", "total_tokens")}) from exc
 
-    def _request(self, *, prompt, request, parse, payload=None, items=None, audit_context=None):
+    def _request(self, *, prompt, request, parse, payload=None, items=None, audit_context=None,
+                 _personal_fallback=False):
         """The only SDK access point; begin is committed before any API access."""
         audit = AIRequestLog(self.database_path)
         audit.ensure_schema()
         context = _request_context(prompt, payload, items, audit_context)
         log_id = audit.begin(prompt=prompt, full_prompt=request, **context)
         details = {"log_id": log_id}
+        use_personal_fallback = False
         try:
-            client = self._get_client()
+            client = self._get_client(personal=True) if _personal_fallback else self._get_client()
             try:
                 response = client.responses.create(**request)
             except Exception as exc:
+                use_personal_fallback = not _personal_fallback and self._can_fallback(exc)
                 raise AIError("The AI service could not complete the request. Please try again.",
                               error_type=type(exc).__name__, log_id=log_id) from exc
             details.update(output_text=_field(response, "output_text"),
@@ -188,6 +282,11 @@ class OpenAIService:
             exc.log_id = log_id
             status = "invalid_response" if exc.error_type in {"InvalidJSON", "InvalidJSONShape", "InvalidResponse"} else "failed"
             self._finish_audit(audit, log_id, status=status, error=exc)
+            if use_personal_fallback:
+                logger.warning("UBS gateway unavailable; using personal OpenAI fallback.")
+                # Commit the failed UBS attempt before starting a separately audited call.
+                return self._request(prompt=prompt, request=request, parse=parse, payload=payload,
+                                     items=items, audit_context=audit_context, _personal_fallback=True)
             raise
         except Exception as exc:
             error = AIError("The AI returned an unreadable response. Please try again.",

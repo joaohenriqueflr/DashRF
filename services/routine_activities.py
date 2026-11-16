@@ -46,9 +46,13 @@ class RoutineActivities:
     def get_activity_completion(self, routine_id, activity_id, dt_ref=None):
         with self.connection() as conn:
             self._activity_scope(conn, routine_id, activity_id)
-            row = conn.execute("""SELECT * FROM UGM_ROUTINE_EXECUTIONS WHERE ID_ACTIVITY=? AND DT_REF=?
-                AND STATUS='SUCCESS' AND FL_COMPLETES_ACTIVITY=1""", (activity_id, dt_ref or self.today())).fetchone()
+            row = self._activity_completion(conn, activity_id, dt_ref or self.today())
             return dict(row) if row else None
+
+    @staticmethod
+    def _activity_completion(conn, activity_id, dt_ref):
+        return conn.execute("""SELECT * FROM UGM_ROUTINE_EXECUTIONS WHERE ID_ACTIVITY=? AND DT_REF=?
+            AND STATUS='SUCCESS' AND FL_COMPLETES_ACTIVITY=1""", (activity_id, dt_ref)).fetchone()
 
     @staticmethod
     def _assert_activity_open(conn, activity_id, dt_ref):

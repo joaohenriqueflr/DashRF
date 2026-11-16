@@ -30,6 +30,39 @@ A NTN-B começa com:
 
 As três atividades compartilham a mesma referência de prompt e o mesmo contrato Python da ferramenta. Cada uma possui sua permissão e seu estado diário. O usuário escolhe a atividade; não há avanço automático para a próxima atividade pendente. Os horários são prazos em `America/Sao_Paulo`, sem execução autônoma por relógio.
 
+## Novas atividades de importação — estrutura inicial
+
+`services/routine_catalog.py` centraliza o catálogo reutilizável dos novos espaços de importação. Os dados continuam em `UGM_ROUTINES` e `UGM_ROUTINE_ACTIVITIES`; não há páginas Python duplicadas por instituição. Cada atividade abre o workspace existente por `/routines/workspace?routine=<ID_ROUTINE>&activity=<ID_ACTIVITY>`, com chat e timeline vertical à direita.
+
+| Rotina | Atividades | Horário |
+|---|---|---|
+| NTN-F | Importar Casadas (`NTNF_CASADAS`) | 09:30, diariamente |
+| NTN-F | Importar Cotação DI (`NTNF_DI_QUOTES`) | 10:30, diariamente; poderá repetir ao longo do dia |
+| Run Bancários (`BANK_RUN`) | Importar C6, Caixa, Rabobank, Bocom BBM, BTG, ABC, Daycoval e BV | Sem horário definido |
+| Crédito Privado | Importar xBridge, Santander, BGC, Ativa e Inter | Sem horário definido |
+
+As quinze atividades estão em preparação, com um prompt mock independente por atividade em `AI_PROMPTS`. As colunas, unidades, validações e tabelas de destino serão definidas depois. A Cotação DI repetida deverá substituir a cotação anterior da mesma atividade e data após confirmação, sem criar novos horários na agenda. As fontes bancárias não são presumidas como brokers já compatíveis com a ferramenta de cotações existente.
+
+`OPTIONS_JSON` contém `presentation="table_import"`, `implementation_status="mock"` e `repeatable` (true em Cotação DI). O layout mostra uma prévia ilustrativa com o botão de importação desabilitado. Mensagens explicam o fluxo previsto sem acessar o SDK, gravar dados operacionais ou concluir a atividade. O backend também bloqueia execução e conclusão manual, inclusive se uma permissão for adicionada por engano. Não há interpretação ou validação fictícia de tabelas.
+
+Os antigos espaços genéricos de NTN-F e Crédito ficam inativos; suas definições, permissões e históricos são conservados. O catálogo é instalado automaticamente apenas em um banco novo. Para atualizar um banco existente, a instalação é explícita e não sobrescreve as atividades e prompts que já existem:
+
+```python
+from services.prompts import PromptStore
+from services.routines import RoutineService
+from services.routine_catalog import install_import_catalog, install_mock_prompts
+
+engine = RoutineService('data/fixed_income.db')
+engine.ensure_schema()
+with engine.connection(immediate=True) as conn:
+    install_import_catalog(conn)
+store = PromptStore(engine.database_path)
+model = store.get_active('routines', 'NTNB_RUN').model
+install_mock_prompts(store, model)
+```
+
+Na próxima etapa, cada atividade poderá receber seu próprio contrato e suas ferramentas. A apresentação continuará compartilhada; a gravação seguirá o executor transacional com revisão, confirmação, substituição e auditoria já existentes.
+
 ## Colunas de configuração
 
 As configurações comuns ficam visíveis em `UGM_ROUTINE_ACTIVITIES`:
@@ -51,7 +84,15 @@ As ferramentas são identificadas por `NM_TOOL`. Seus handlers, descrições e s
 
 Assim, a conclusão, seu usuário, horário e resultado ficam no mesmo registro de execução. Consultas auxiliares podem ter sucesso sem concluir a atividade. A gravação operacional e a mudança para `SUCCESS` acontecem na mesma transação. A proteção de unicidade também existe no SQLite, além da verificação no serviço.
 
-Falhas e cancelamentos permitem nova tentativa. Duas propostas concorrentes não podem concluir a mesma atividade duas vezes no mesmo dia. Reconfirmar a mesma execução concluída é idempotente. Ao concluir uma atividade, outra importação requer selecionar outra atividade; um dia adicional tem sua própria ocorrência.
+Falhas e cancelamentos permitem nova tentativa. Duas propostas concorrentes não podem concluir a mesma atividade duas vezes no mesmo dia. Reconfirmar a mesma execução concluída é idempotente. Um dia adicional tem sua própria ocorrência.
+
+Todas as rotinas permitem corrigir seus dados após a conclusão da atividade. Reimportar cotações ou devedores na mesma atividade e data prepara a substituição do lote anterior daquela ação. O usuário recebe a pergunta sobre excluir os registros anteriores e inserir os novos, revisa o card e usa **Confirmar substituição** ou **Cancelar**. A exclusão do lote anterior, a inserção do novo e a eventual transferência da conclusão acontecem na mesma transação; qualquer falha restaura os dados anteriores. Outras atividades e outros dias são preservados. Uma proposta antiga não pode substituir um lote que mudou depois de sua preparação.
+
+`UGM_ROUTINE_EXECUTIONS.ID_REPLACED_EXECUTION` identifica a execução substituída. Se ela era a conclusão vigente, a nova execução passa a ter `FL_COMPLETES_ACTIVITY=1`, e a anterior fica com `0`. Correções pontuais e ações auxiliares não criam uma segunda conclusão nem bloqueiam novas correções. Ambas as execuções permanecem no histórico e no chat. O resumo e o gráfico usam somente as runs vigentes. `ID_ROUTINE_EXECUTION` em `FIXED_INCOME_BROKER_DATA` e `UGM_ROUTINES_DEVEDORES` vincula cada registro ao lote que o gravou. Registros antigos recebem vínculo quando há identificação inequívoca; uma identificação ambígua interrompe a substituição sem excluir dados.
+
+Em Devedores, `update_debtor` permite corrigir `nr_days`, `responsible`, `case_description`, `resolved` e `new_client_id`, usando `client_id` como alvo original imutável. `description` continua acrescentando uma observação com autor e horário; `case_description` substitui o texto após revisão explícita. A conta pode ser corrigida por `new_client_id` somente se não colidir com outra conta da mesma data. O card mostra os valores atuais e os propostos, com botão **Confirmar alteração**. Os valores anteriores ficam no `RESULT_JSON.current` da execução, mesmo quando a descrição é substituída. Se outra pessoa alterar os dados antes da confirmação, o card é atualizado e exige nova revisão. Reimportar um lote de devedores também considera correções de conta e observações já realizadas, exibindo o estado atual antes de excluí-lo.
+
+O contrato reutilizável `ToolSpec.replace` define como remover exclusivamente o lote anterior de uma ferramenta de importação. O executor compartilhado determina o alvo, controla a confirmação, valida novamente permissões e dados, e garante a transação. Ferramentas de alteração pontual fornecem `current` em seu preview para detectar alterações concorrentes. Nenhum handler confirma ou cancela propostas por conta própria.
 
 ## Consultas para depuração
 
@@ -69,7 +110,7 @@ Tentativas e conclusões do dia:
 
 ```sql
 SELECT ID_EXECUTION, ID_ACTIVITY, DT_REF, USERNAME, NM_ACTION,
-       STATUS, FL_COMPLETES_ACTIVITY, TS_REQUEST, TS_EXECUTION, ERROR_MESSAGE
+       STATUS, FL_COMPLETES_ACTIVITY, ID_REPLACED_EXECUTION, TS_REQUEST, TS_EXECUTION, ERROR_MESSAGE
 FROM UGM_ROUTINE_EXECUTIONS
 WHERE DT_REF = '2026-11-09'
 ORDER BY ID_EXECUTION;
@@ -109,6 +150,8 @@ engine.process_routine_message(
 
 O prompt deve estar publicado em `AI_PROMPTS` usando `PromptStore` ou a página de manutenção de IA. Nenhum modelo é fixado no código da rotina. `configure_activity` substitui a lista de ferramentas da atividade; ferramentas mantidas conservam sua política e opções. `configure_activity_schedule` edita diretamente `DEADLINE_TIME`, `RECURRENCE` e `COMPLETION_ACTION`, sem criar outra linha ou identificador de agenda.
 
+`CREDIT_RUN_PROMPT.md` e `DEBTORS_PROMPT.md` documentam os prompts de importação e correção desses fluxos. Como não havia prompts ativos para essas duas rotinas no banco local, suas versões iniciais foram publicadas com o modelo já configurado para NTN-B. O modelo continua configurável em `AI_PROMPTS`; o executor não fixa nem herda modelos em runtime.
+
 ## Interface e contratos operacionais
 
 `/routines` mostra o Panorama do dia, com agenda compartilhada, filtros e atenção para atrasos, falhas e confirmações. Cada entrada abre `/routines/workspace?routine=<ID_ROUTINE>&activity=<ID_ACTIVITY>`. A leitura do panorama não opera ferramentas, não confirma propostas e não expõe conversas.
@@ -119,7 +162,7 @@ NTN-B e NTN-F são chats restritos de importação. O usuário cola a tabela XP;
 
 NTN-B usa taxas decimais: 7,25% corresponde a `0.0725`. Ativos precisam existir na classificação; lado, unidade e vencimento ambíguos exigem esclarecimento. NTN-F recebe o spread original em pontos-base e depende de curva DI e convenção financeira configuradas em `configure_ntnf_market_data`. Sem essa integração, não grava taxas estimadas; taxas derivadas alteradas após a revisão exigem nova confirmação.
 
-Crédito e Devedores usam o mesmo executor e contratos Python. Arquivos estruturados são aceitos apenas nas atividades que usam esse fluxo. `UGM_ROUTINES_DEVEDORES` mantém a chave `(DT_REF, ID_CLIENT)` e a convenção `FL_RESOLVED=0` para resolvido e `1` para devedor. Relatórios não enviam e-mails autonomamente.
+Crédito e Devedores usam o mesmo executor, contratos Python e confirmação de correções das demais rotinas. Arquivos estruturados são aceitos apenas nas atividades que usam esse fluxo. `UGM_ROUTINES_DEVEDORES` mantém a chave `(DT_REF, ID_CLIENT)` e a convenção `FL_RESOLVED=0` para resolvido e `1` para devedor. Relatórios podem ser atualizados após a conclusão e não enviam e-mails autonomamente.
 
 O resumo de runs compara todas as atividades da rotina no dia. Cada execução confirmada de `save_quotes` gera um par de séries: Bid contínuo e Ask tracejado. Os vértices seguem os vencimentos da classificação; as taxas são convertidas de decimal para percentual na apresentação. Lacunas e observações repetidas são preservadas, sem interpolação ou média inventada. Propostas pendentes, falhas e cancelamentos não entram no gráfico.
 

@@ -132,7 +132,7 @@ class RoutineTests(unittest.TestCase):
             ("2026-11-03", "00123", 3, "GWM", "Ainda devedor", 1),
         ]
         for case in cases:
-            self.execute("INSERT INTO UGM_DEVEDORES VALUES (?,?,?,?,?,?)", case)
+            self.execute("INSERT INTO UGM_DEVEDORES(DT_REF,ID_CLIENT,NR_DAYS,NM_RESP_GWM,DESCR,FL_RESOLVED) VALUES (?,?,?,?,?,?)", case)
         self.service.ensure_schema()
         self.service.ensure_schema()
         self.assertEqual(self.scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='UGM_DEVEDORES'"), 0)
@@ -144,10 +144,10 @@ class RoutineTests(unittest.TestCase):
         self.assertEqual(shared["rows"][0]["ID_CLIENT"], "00123")
         self.assertEqual(shared["rows"][0]["FL_RESOLVED"], 1)
         with self.assertRaises(sqlite3.IntegrityError):
-            self.execute("INSERT INTO UGM_ROUTINES_DEVEDORES VALUES (?,?,?,?,?,?)", cases[1])
+            self.execute("INSERT INTO UGM_ROUTINES_DEVEDORES(DT_REF,ID_CLIENT,NR_DAYS,NM_RESP_GWM,DESCR,FL_RESOLVED) VALUES (?,?,?,?,?,?)", cases[1])
 
     def test_debtors_rename_conflict_preserves_both_tables(self):
-        self.execute("INSERT INTO UGM_ROUTINES_DEVEDORES VALUES ('2026-11-03','00123',1,'GWM','Current case',1)")
+        self.execute("INSERT INTO UGM_ROUTINES_DEVEDORES(DT_REF,ID_CLIENT,NR_DAYS,NM_RESP_GWM,DESCR,FL_RESOLVED) VALUES ('2026-11-03','00123',1,'GWM','Current case',1)")
         self.execute("CREATE TABLE UGM_DEVEDORES AS SELECT * FROM UGM_ROUTINES_DEVEDORES")
         self.execute("UPDATE UGM_DEVEDORES SET DESCR='Legacy case'")
         with self.assertRaisesRegex(ValueError, "Both UGM_DEVEDORES and UGM_ROUTINES_DEVEDORES exist"):
@@ -699,9 +699,10 @@ class RoutineTests(unittest.TestCase):
                     self.assertIsNone(self.timeline_step(expected_step)["completed_at"])
                     self.assertEqual(self.timeline_step(expected_step)["progress"], "PENDING_REVIEW")
                 self.service.confirm_action(execution["ID_EXECUTION"], "Alice")
-                with self.assertRaisesRegex(ValueError, "já foi concluída"):
-                    self.proposal(activity_id=activity_id)
-        executions = self.service.get_routine_executions("NTNB_RUN")
+                replacement = self.proposal(activity_id=activity_id)
+                self.assertEqual(replacement['ID_REPLACED_EXECUTION'], execution['ID_EXECUTION'])
+                self.service.cancel_action(replacement['ID_EXECUTION'], 'Alice')
+        executions = [row for row in self.service.get_routine_executions("NTNB_RUN") if row['STATUS']=='SUCCESS']
         self.assertEqual([row["ID_ACTIVITY"] for row in executions], [third, first, second])
         self.assertTrue(all(row["STATUS"] == "SUCCESS" for row in executions))
         for step in (first, second, third):
@@ -791,12 +792,175 @@ class RoutineTests(unittest.TestCase):
         self.assertEqual(service.get_operational_data("DEBTORS")["rows"], [])
         self.assertEqual(self.scalar("SELECT COUNT(*) FROM UGM_ROUTINES_DEVEDORES"), 2)
 
-    def test_reimport_does_not_overwrite_existing_debtor_description(self):
+    def test_debtor_reimport_keeps_existing_description_until_confirmation(self):
         args = self.import_debtors()
         args["rows"][0]["DESCR"] = "Must not replace existing history"
-        with self.assertRaises(ValueError):
-            self.service.prepare_action("DEBTORS", "Bob", "import_debtors", args)
+        proposal = self.service.prepare_action("DEBTORS", "Bob", "import_debtors", args)
+        self.assertEqual(proposal['STATUS'], 'PENDING_REVIEW')
+        self.assertIn('replacement', proposal['RESULT_JSON'])
+        self.service.cancel_action(proposal['ID_EXECUTION'], 'Bob')
         self.assertEqual(self.scalar("SELECT DESCR FROM UGM_ROUTINES_DEVEDORES WHERE ID_CLIENT='00123'"), "Original case")
+
+    def test_credit_batch_can_be_replaced_after_completion(self):
+        args = {'source': 'xBridge', 'rows': [{'NM_SECURITY': 'TEST11', 'SIDE': 'Bid', 'TX_QUOTE': 0.10}]}
+        first = self.service.prepare_action('CREDIT_RUN', 'Alice', 'save_quotes', args)
+        self.service.confirm_action(first['ID_EXECUTION'], 'Alice')
+        args['rows'][0]['TX_QUOTE'] = 0.11
+        proposal = self.service.prepare_action('CREDIT_RUN', 'Bob', 'save_quotes', args)
+        self.assertEqual(proposal['ID_REPLACED_EXECUTION'], first['ID_EXECUTION'])
+        self.assertIn('Deseja excluir', self.service.load_chat_history('CREDIT_RUN', 'Bob')[-1]['ASSISTANT_MESSAGE'])
+        self.assertEqual(self.scalar("SELECT TX_QUOTE FROM FIXED_INCOME_BROKER_DATA WHERE NM_SECURITY='TEST11'"), 0.10)
+        self.assertEqual(self.service.confirm_action(proposal['ID_EXECUTION'], 'Bob')['STATUS'], 'SUCCESS')
+        self.assertEqual(self.scalar("SELECT TX_QUOTE FROM FIXED_INCOME_BROKER_DATA WHERE NM_SECURITY='TEST11'"), 0.11)
+        self.assertEqual(self.service.get_daily_quote_runs('CREDIT_RUN')['summary']['run_count'], 1)
+
+    def test_credit_chat_asks_to_replace_saved_batch_and_audits_the_llm_request(self):
+        self.seed_chat('CREDIT_RUN')
+        args = {'source': 'xBridge', 'rows': [{'NM_SECURITY': 'TEST11', 'SIDE': 'Bid', 'TX_QUOTE': 0.10}]}
+        first = self.service.prepare_action('CREDIT_RUN', 'Alice', 'save_quotes', args)
+        self.service.confirm_action(first['ID_EXECUTION'], 'Alice')
+        args['rows'][0]['TX_QUOTE'] = 0.11
+        self.mock_api([self.api_response(items=[{'type': 'function_call', 'call_id': 'credit-correction',
+            'name': 'save_quotes', 'arguments': json.dumps(args)}], usage={'input_tokens': 10, 'output_tokens': 5, 'total_tokens': 15})])
+        result = self.service.process_routine_message('CREDIT_RUN', 'Alice', 'Correct the saved xBridge run to 11%')
+        self.assertEqual(result['status'], 'PENDING_REVIEW')
+        self.assertIn('Deseja excluir', result['text'])
+        self.assertEqual(self.scalar("SELECT TX_QUOTE FROM FIXED_INCOME_BROKER_DATA WHERE NM_SECURITY='TEST11'"), 0.10)
+        self.assertEqual(len(self.audit_rows()), 1)
+        self.assertEqual(self.audit_rows()[0]['TOTAL_TOKENS'], 15)
+        proposal = self.service.get_routine_executions('CREDIT_RUN')[-1]
+        self.assertEqual(self.service.confirm_action(proposal['ID_EXECUTION'], 'Alice')['STATUS'], 'SUCCESS')
+
+    def test_debtor_chat_prepares_field_correction_after_activity_completion(self):
+        self.import_debtors()
+        self.seed_chat('DEBTORS')
+        self.mock_api([self.api_response(items=[{'type': 'function_call', 'call_id': 'debtor-correction',
+            'name': 'update_debtor', 'arguments': json.dumps({'client_id': '00123', 'nr_days': 4, 'case_description': 'Correction'})}])])
+        result = self.service.process_routine_message('DEBTORS', 'Bob', 'Correct account 00123 to four days and replace its description')
+        self.assertEqual(result['status'], 'PENDING_REVIEW')
+        self.assertIn('Deseja ajustar', result['text'])
+        self.assertEqual(self.scalar("SELECT NR_DAYS FROM UGM_ROUTINES_DEVEDORES WHERE ID_CLIENT='00123'"), 2)
+        proposal = self.service.get_routine_executions('DEBTORS', username='Bob')[-1]
+        self.assertEqual(self.service.confirm_action(proposal['ID_EXECUTION'], 'Bob')['STATUS'], 'SUCCESS')
+        self.assertEqual(self.scalar("SELECT NR_DAYS FROM UGM_ROUTINES_DEVEDORES WHERE ID_CLIENT='00123'"), 4)
+        self.assertEqual(len(self.audit_rows()), 1)
+
+    def test_debtor_batch_replacement_transfers_completion_and_keeps_audit(self):
+        args = self.import_debtors()
+        first = self.service.get_activity_completion('DEBTORS', 'DEBTORS:DEFAULT')
+        args['rows'] = [{**args['rows'][0], 'NR_DAYS': 5, 'DESCR': 'Corrected case'}]
+        proposal = self.service.prepare_action('DEBTORS', 'Bob', 'import_debtors', args)
+        self.assertEqual(len(proposal['RESULT_JSON']['current']), 2)
+        self.assertEqual(self.scalar('SELECT COUNT(*) FROM UGM_ROUTINES_DEVEDORES'), 2)
+        result = self.service.confirm_action(proposal['ID_EXECUTION'], 'Bob')
+        self.assertEqual(result['STATUS'], 'SUCCESS')
+        self.assertEqual(self.scalar('SELECT COUNT(*) FROM UGM_ROUTINES_DEVEDORES'), 1)
+        row = self.execute('SELECT * FROM UGM_ROUTINES_DEVEDORES')[0]
+        self.assertEqual((row['NR_DAYS'], row['DESCR'], row['ID_ROUTINE_EXECUTION']), (5, 'Corrected case', proposal['ID_EXECUTION']))
+        self.assertEqual(result['RESULT_JSON']['current'][0]['DESCR'], 'Original case')
+        self.assertEqual(self.service.get_activity_completion('DEBTORS', 'DEBTORS:DEFAULT')['ID_EXECUTION'], proposal['ID_EXECUTION'])
+        self.assertEqual(self.service.get_execution(first['ID_EXECUTION'], 'Alice')['REPLACED_BY_EXECUTION'], proposal['ID_EXECUTION'])
+
+    def test_failed_debtor_batch_replacement_restores_all_rows_and_completion(self):
+        args = self.import_debtors()
+        original = self.execute('SELECT * FROM UGM_ROUTINES_DEVEDORES ORDER BY ID_CLIENT')
+        proposal = self.service.prepare_action('DEBTORS', 'Bob', 'import_debtors', args)
+        self.execute("CREATE TRIGGER fail_debtor_insert BEFORE INSERT ON UGM_ROUTINES_DEVEDORES BEGIN SELECT RAISE(ABORT,'failure'); END")
+        self.assertEqual(self.service.confirm_action(proposal['ID_EXECUTION'], 'Bob')['STATUS'], 'FAILED')
+        self.assertEqual(self.execute('SELECT * FROM UGM_ROUTINES_DEVEDORES ORDER BY ID_CLIENT'), original)
+        self.assertEqual(self.service.get_activity_completion('DEBTORS', 'DEBTORS:DEFAULT')['ID_EXECUTION'], proposal['ID_REPLACED_EXECUTION'])
+
+    def test_all_debtor_fields_can_be_corrected_on_same_completed_activity(self):
+        self.import_debtors()
+        owner = self.service.get_activity_completion('DEBTORS', 'DEBTORS:DEFAULT')['ID_EXECUTION']
+        args = {'client_id': '00123', 'new_client_id': '00999', 'nr_days': 8, 'responsible': 'New GWM',
+                'case_description': 'Corrected description', 'resolved': True}
+        proposal = self.service.prepare_action('DEBTORS', 'Bob', 'update_debtor', args)
+        self.assertFalse(proposal['FL_COMPLETES_ACTIVITY'])
+        self.assertEqual(self.scalar("SELECT DESCR FROM UGM_ROUTINES_DEVEDORES WHERE ID_CLIENT='00123'"), 'Original case')
+        confirmed = self.service.confirm_action(proposal['ID_EXECUTION'], 'Bob')
+        self.assertEqual(confirmed['STATUS'], 'SUCCESS')
+        row = self.execute("SELECT * FROM UGM_ROUTINES_DEVEDORES WHERE ID_CLIENT='00999'")[0]
+        self.assertEqual((row['NR_DAYS'], row['NM_RESP_GWM'], row['DESCR'], row['FL_RESOLVED']), (8, 'New GWM', 'Corrected description', 0))
+        self.assertEqual(row['ID_ROUTINE_EXECUTION'], owner)
+        self.assertEqual(confirmed['RESULT_JSON']['current']['ID_CLIENT'], '00123')
+        again = self.service.prepare_action('DEBTORS', 'Alice', 'update_debtor', {'client_id': '00999', 'description': 'Another note', 'resolved': False})
+        self.service.confirm_action(again['ID_EXECUTION'], 'Alice')
+        self.assertIn('Another note', self.scalar("SELECT DESCR FROM UGM_ROUTINES_DEVEDORES WHERE ID_CLIENT='00999'"))
+        self.assertEqual(self.service.get_activity_completion('DEBTORS', 'DEBTORS:DEFAULT')['ID_EXECUTION'], owner)
+
+    def test_corrections_remain_available_with_explicit_import_completion_action(self):
+        self.import_debtors()
+        self.service.configure_activity_schedule('DEBTORS', 'DEBTORS:DEFAULT', completion_action='import_debtors')
+        proposal = self.service.prepare_action('DEBTORS', 'Bob', 'update_debtor', {'client_id': '00123', 'nr_days': 3})
+        self.assertEqual(self.service.confirm_action(proposal['ID_EXECUTION'], 'Bob')['STATUS'], 'SUCCESS')
+        self.assertFalse(proposal['FL_COMPLETES_ACTIVITY'])
+
+    def test_cancelled_record_correction_preserves_existing_values(self):
+        self.import_debtors()
+        original = self.execute('SELECT * FROM UGM_ROUTINES_DEVEDORES ORDER BY ID_CLIENT')
+        proposal = self.service.prepare_action('DEBTORS', 'Alice', 'update_debtor', {'client_id': '00123', 'case_description': ''})
+        self.service.cancel_action(proposal['ID_EXECUTION'], 'Alice')
+        self.service.confirm_action(proposal['ID_EXECUTION'], 'Alice')
+        self.assertEqual(self.execute('SELECT * FROM UGM_ROUTINES_DEVEDORES ORDER BY ID_CLIENT'), original)
+
+    def test_concurrent_record_change_requires_review_of_current_values_again(self):
+        self.import_debtors()
+        first = self.service.prepare_action('DEBTORS', 'Alice', 'update_debtor', {'client_id': '00123', 'nr_days': 5})
+        second = self.service.prepare_action('DEBTORS', 'Bob', 'update_debtor', {'client_id': '00123', 'nr_days': 7})
+        self.service.confirm_action(first['ID_EXECUTION'], 'Alice')
+        rereview = self.service.confirm_action(second['ID_EXECUTION'], 'Bob')
+        self.assertEqual(rereview['STATUS'], 'PENDING_REVIEW')
+        self.assertEqual(rereview['RESULT_JSON']['current']['NR_DAYS'], 5)
+        self.assertEqual(self.scalar("SELECT NR_DAYS FROM UGM_ROUTINES_DEVEDORES WHERE ID_CLIENT='00123'"), 5)
+        self.assertEqual(self.service.confirm_action(second['ID_EXECUTION'], 'Bob')['STATUS'], 'SUCCESS')
+        self.assertEqual(self.scalar("SELECT NR_DAYS FROM UGM_ROUTINES_DEVEDORES WHERE ID_CLIENT='00123'"), 7)
+
+    def test_batch_replacement_requires_review_again_after_individual_update(self):
+        args = self.import_debtors()
+        proposal = self.service.prepare_action('DEBTORS', 'Alice', 'import_debtors', args)
+        update = self.service.prepare_action('DEBTORS', 'Bob', 'update_debtor', {'client_id': '00123', 'description': 'Latest contact'})
+        self.service.confirm_action(update['ID_EXECUTION'], 'Bob')
+        rereview = self.service.confirm_action(proposal['ID_EXECUTION'], 'Alice')
+        self.assertEqual(rereview['STATUS'], 'PENDING_REVIEW')
+        self.assertIn('Latest contact', rereview['RESULT_JSON']['current'][0]['DESCR'])
+        self.assertIn('Latest contact', self.scalar("SELECT DESCR FROM UGM_ROUTINES_DEVEDORES WHERE ID_CLIENT='00123'"))
+        self.assertEqual(self.service.confirm_action(proposal['ID_EXECUTION'], 'Alice')['STATUS'], 'SUCCESS')
+
+    def test_debtor_replacement_handles_corrected_account_and_protects_other_batches(self):
+        args = self.import_debtors()
+        update = self.service.prepare_action('DEBTORS', 'Alice', 'update_debtor', {'client_id': '00123', 'new_client_id': '00999'})
+        self.service.confirm_action(update['ID_EXECUTION'], 'Alice')
+        self.activity('sibling', routine='DEBTORS', tools=['import_debtors'])
+        sibling_args = {'rows': [{'ID_CLIENT': '77777', 'NR_DAYS': 1, 'NM_RESP_GWM': 'Other', 'DESCR': 'Other activity'}]}
+        sibling = self.service.prepare_action('DEBTORS', 'Bob', 'import_debtors', sibling_args, activity_id='sibling')
+        self.service.confirm_action(sibling['ID_EXECUTION'], 'Bob')
+        with self.assertRaises(ValueError):
+            self.service.prepare_action('DEBTORS', 'Alice', 'import_debtors', sibling_args, activity_id='DEBTORS:DEFAULT')
+        proposal = self.service.prepare_action('DEBTORS', 'Alice', 'import_debtors', args, activity_id='DEBTORS:DEFAULT')
+        self.assertIn('00999', {r['ID_CLIENT'] for r in proposal['RESULT_JSON']['current']})
+        self.assertEqual(self.service.confirm_action(proposal['ID_EXECUTION'], 'Alice')['STATUS'], 'SUCCESS')
+        self.assertEqual(self.scalar("SELECT DESCR FROM UGM_ROUTINES_DEVEDORES WHERE ID_CLIENT='77777'"), 'Other activity')
+        self.assertEqual(self.scalar("SELECT COUNT(*) FROM UGM_ROUTINES_DEVEDORES WHERE ID_CLIENT='00999'"), 0)
+
+    def test_account_correction_cannot_overwrite_an_existing_account(self):
+        self.import_debtors()
+        with self.assertRaises(ValueError):
+            self.service.prepare_action('DEBTORS', 'Alice', 'update_debtor', {'client_id': '00123', 'new_client_id': '00456'})
+        self.assertEqual(self.scalar('SELECT COUNT(*) FROM UGM_ROUTINES_DEVEDORES'), 2)
+
+    def test_existing_debtor_schema_backfills_batch_owner_without_changing_case_values(self):
+        args = self.import_debtors()
+        previous = self.service.get_activity_completion('DEBTORS', 'DEBTORS:DEFAULT')
+        before = self.execute('SELECT DT_REF,ID_CLIENT,NR_DAYS,NM_RESP_GWM,DESCR,FL_RESOLVED FROM UGM_ROUTINES_DEVEDORES ORDER BY ID_CLIENT')
+        self.execute('DROP INDEX idx_debtor_routine_execution')
+        self.execute('ALTER TABLE UGM_ROUTINES_DEVEDORES DROP COLUMN ID_ROUTINE_EXECUTION')
+        self.service.ensure_schema()
+        self.service.ensure_schema()
+        self.assertEqual(self.execute('SELECT DT_REF,ID_CLIENT,NR_DAYS,NM_RESP_GWM,DESCR,FL_RESOLVED FROM UGM_ROUTINES_DEVEDORES ORDER BY ID_CLIENT'), before)
+        self.assertEqual(self.scalar('SELECT COUNT(*) FROM UGM_ROUTINES_DEVEDORES WHERE ID_ROUTINE_EXECUTION=?', (previous['ID_EXECUTION'],)), 2)
+        proposal = self.service.prepare_action('DEBTORS', 'Bob', 'import_debtors', args)
+        self.assertEqual(self.service.confirm_action(proposal['ID_EXECUTION'], 'Bob')['STATUS'], 'SUCCESS')
 
     def test_credit_sources_share_quote_executor_without_accepting_sovereigns(self):
         args = {"source": "xBridge", "rows": [{"NM_SECURITY": "TEST11", "SIDE": "Ask", "TX_QUOTE": 0.12}]}
@@ -1105,8 +1269,8 @@ class RoutineTests(unittest.TestCase):
         self.assertEqual(self.scalar("SELECT COUNT(*) FROM UGM_ROUTINE_ACTIVITIES WHERE ID_ACTIVITY='ntnb-second'"),1)
         proposal=self.proposal(activity_id='ntnb-second')
         self.service.confirm_action(proposal['ID_EXECUTION'],'Alice')
-        with self.assertRaisesRegex(ValueError,'já foi concluída'):
-            self.proposal(activity_id='ntnb-second')
+        replacement = self.proposal(activity_id='ntnb-second')
+        self.assertEqual(replacement['ID_REPLACED_EXECUTION'], proposal['ID_EXECUTION'])
 
     def test_activity_cannot_use_a_sibling_schedule_chat_or_review_card(self):
         step = self.schedule()
@@ -1168,6 +1332,144 @@ class RoutineTests(unittest.TestCase):
         self.assertEqual(self.scalar("SELECT COUNT(*) FROM UGM_ROUTINE_EXECUTIONS WHERE STATUS='SUCCESS' AND FL_COMPLETES_ACTIVITY=1"), 1)
         self.assertEqual(self.scalar("SELECT COUNT(*) FROM FIXED_INCOME_BROKER_DATA WHERE DT_REF='2026-11-03'"), 1)
 
+    def test_reimport_asks_before_replacement_and_cancel_keeps_original_data(self):
+        first = self.proposal()
+        self.service.confirm_action(first['ID_EXECUTION'], 'Alice')
+        result = self.service.process_routine_message('NTNB_RUN', 'Alice', self.canonical_run())
+        self.assertEqual(result['status'], 'PENDING_REVIEW')
+        self.assertIn('Deseja excluir', result['text'])
+        self.assertIn('Confirmar substituição', result['text'])
+        self.assertEqual(self.scalar("SELECT TX_QUOTE FROM FIXED_INCOME_BROKER_DATA WHERE DT_REF=?", (self.service.today(),)), 0.075)
+        self.service.process_routine_message('NTNB_RUN', 'Alice', 'sim')
+        self.assertEqual(self.service.get_execution(result['execution_id'], 'Alice')['STATUS'], 'PENDING_REVIEW')
+        self.service.cancel_action(result['execution_id'], 'Alice')
+        self.assertEqual(self.service.get_activity_completion('NTNB_RUN', 'NTNB_RUN:DEFAULT')['ID_EXECUTION'], first['ID_EXECUTION'])
+        self.assertEqual(self.scalar('SELECT COUNT(*) FROM FIXED_INCOME_BROKER_DATA'), 2)
+        self.assertIn('mantidos', self.service.load_chat_history('NTNB_RUN', 'Alice')[-2]['ASSISTANT_MESSAGE'])
+
+    def test_request_to_redo_a_completed_activity_explains_replacement_without_llm(self):
+        ai = self.seed_chat('NTNB_RUN')
+        first = self.proposal()
+        self.service.confirm_action(first['ID_EXECUTION'], 'Alice')
+        result = self.service.process_routine_message('NTNB_RUN', 'Alice', 'Quero refazer a atividade')
+        self.assertIn('Deseja substituir', result['text'])
+        self.assertIn('Cole a nova tabela', result['text'])
+        ai.extract.assert_not_called()
+        self.assertEqual(self.scalar('SELECT COUNT(*) FROM UGM_ROUTINE_EXECUTIONS'), 1)
+
+    def test_replacement_deletes_entire_selected_batch_and_preserves_other_data(self):
+        args = self.quotes()
+        args['rows'].append({**args['rows'][0], 'SIDE': 'Ask', 'TX_QUOTE': 0.076})
+        first = self.service.prepare_action('NTNB_RUN', 'Alice', 'save_quotes', args)
+        self.service.confirm_action(first['ID_EXECUTION'], 'Alice')
+        self.service.configure_activity('NTNB_RUN', 'sibling', 'Sibling', prompt_key='NTNB_RUN', tools=['save_quotes'],
+            config=dict(workflow='quote_import', sources=['XP'], instrument_types=['NTN-B'], completion_action='save_quotes'))
+        sibling = self.service.prepare_action('NTNB_RUN', 'Bob', 'save_quotes', self.quotes(TX_QUOTE=0.08), activity_id='sibling')
+        self.service.confirm_action(sibling['ID_EXECUTION'], 'Bob')
+        replacement = self.service.prepare_action('NTNB_RUN', 'Alice', 'save_quotes', self.quotes(TX_QUOTE=0.09), activity_id='NTNB_RUN:DEFAULT')
+        self.assertEqual(self.scalar('SELECT COUNT(*) FROM FIXED_INCOME_BROKER_DATA'), 4)
+        self.assertEqual(self.service.confirm_action(replacement['ID_EXECUTION'], 'Alice')['STATUS'], 'SUCCESS')
+        self.assertEqual(self.scalar('SELECT COUNT(*) FROM FIXED_INCOME_BROKER_DATA'), 3)
+        self.assertEqual(self.scalar('SELECT COUNT(*) FROM FIXED_INCOME_BROKER_DATA WHERE ID_ROUTINE_EXECUTION=?', (first['ID_EXECUTION'],)), 0)
+        self.assertEqual(self.scalar('SELECT TX_QUOTE FROM FIXED_INCOME_BROKER_DATA WHERE ID_ROUTINE_EXECUTION=?', (sibling['ID_EXECUTION'],)), 0.08)
+        self.assertEqual(self.service.get_activity_completion('NTNB_RUN', 'NTNB_RUN:DEFAULT')['ID_EXECUTION'], replacement['ID_EXECUTION'])
+        self.assertEqual(self.service.get_execution(first['ID_EXECUTION'], 'Alice')['REPLACED_BY_EXECUTION'], replacement['ID_EXECUTION'])
+        snapshot = self.service.get_daily_quote_runs('NTNB_RUN')
+        self.assertEqual(snapshot['summary']['run_count'], 2)
+        self.assertEqual({r['id_execution'] for r in snapshot['runs']}, {sibling['ID_EXECUTION'], replacement['ID_EXECUTION']})
+        self.service.confirm_action(replacement['ID_EXECUTION'], 'Alice')
+        self.assertEqual(self.scalar('SELECT COUNT(*) FROM FIXED_INCOME_BROKER_DATA'), 3)
+
+    def test_failed_replacement_rolls_back_deletion_and_keeps_original_completion(self):
+        first = self.proposal()
+        self.service.confirm_action(first['ID_EXECUTION'], 'Alice')
+        replacement = self.proposal()
+        self.execute("CREATE TRIGGER fail_replacement BEFORE INSERT ON FIXED_INCOME_BROKER_DATA BEGIN SELECT RAISE(ABORT,'failure'); END")
+        result = self.service.confirm_action(replacement['ID_EXECUTION'], 'Alice')
+        self.assertEqual(result['STATUS'], 'FAILED')
+        self.assertEqual(self.scalar('SELECT ID_ROUTINE_EXECUTION FROM FIXED_INCOME_BROKER_DATA WHERE DT_REF=?', (self.service.today(),)), first['ID_EXECUTION'])
+        self.assertEqual(self.service.get_activity_completion('NTNB_RUN', 'NTNB_RUN:DEFAULT')['ID_EXECUTION'], first['ID_EXECUTION'])
+        self.assertEqual(self.service.get_daily_quote_runs('NTNB_RUN')['summary']['run_count'], 1)
+
+    def test_replacement_revalidates_edits_and_permissions_without_touching_saved_data(self):
+        first = self.proposal()
+        self.service.confirm_action(first['ID_EXECUTION'], 'Alice')
+        replacement = self.proposal()
+        with self.assertRaises(ValueError):
+            self.service.confirm_action(replacement['ID_EXECUTION'], 'Alice', edited_args=self.quotes(TX_QUOTE=7.5))
+        self.execute("UPDATE UGM_ROUTINE_ACTIVITY_TOOLS SET FL_ACTIVE=0 WHERE ID_ACTIVITY='NTNB_RUN:DEFAULT' AND NM_TOOL='save_quotes'")
+        with self.assertRaisesRegex(ValueError, 'not enabled'):
+            self.service.confirm_action(replacement['ID_EXECUTION'], 'Alice')
+        self.assertEqual(self.service.get_execution(replacement['ID_EXECUTION'], 'Alice')['STATUS'], 'PENDING_REVIEW')
+        self.assertEqual(self.scalar('SELECT ID_ROUTINE_EXECUTION FROM FIXED_INCOME_BROKER_DATA WHERE DT_REF=?', (self.service.today(),)), first['ID_EXECUTION'])
+
+    def test_repeated_corrections_keep_only_latest_run_in_operational_data_and_chart(self):
+        previous = None
+        for rate in (0.075, 0.08, 0.085):
+            proposal = self.service.prepare_action('NTNB_RUN', 'Alice', 'save_quotes', self.quotes(TX_QUOTE=rate))
+            self.assertEqual(proposal['ID_REPLACED_EXECUTION'], previous)
+            self.assertEqual(self.service.confirm_action(proposal['ID_EXECUTION'], 'Alice')['STATUS'], 'SUCCESS')
+            previous = proposal['ID_EXECUTION']
+        self.assertEqual(self.scalar('SELECT COUNT(*) FROM FIXED_INCOME_BROKER_DATA WHERE DT_REF=?', (self.service.today(),)), 1)
+        snapshot = self.service.get_daily_quote_runs('NTNB_RUN')
+        self.assertEqual(snapshot['summary']['run_count'], 1)
+        self.assertEqual(snapshot['rows'][0]['TX_QUOTE'], 0.085)
+        self.assertEqual(self.scalar("SELECT COUNT(*) FROM UGM_ROUTINE_EXECUTIONS WHERE STATUS='SUCCESS'"), 3)
+        self.assertEqual(self.scalar("SELECT COUNT(*) FROM UGM_ROUTINE_EXECUTIONS WHERE STATUS='SUCCESS' AND FL_COMPLETES_ACTIVITY=1"), 1)
+
+    def test_competing_replacements_cannot_replace_unreviewed_newer_run(self):
+        first = self.proposal()
+        self.service.confirm_action(first['ID_EXECUTION'], 'Alice')
+        replacements = [self.proposal(), self.service.prepare_action('NTNB_RUN', 'Bob', 'save_quotes', self.quotes(TX_QUOTE=0.08))]
+        def confirm(item):
+            try:
+                return RoutineService(self.db, clock=lambda: self.now).confirm_action(item['ID_EXECUTION'], item['USERNAME'])['STATUS']
+            except ValueError as exc:
+                self.assertIn('run anterior mudou', str(exc))
+                return 'STALE'
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            self.assertCountEqual(list(pool.map(confirm, replacements)), ['SUCCESS', 'STALE'])
+        self.assertEqual(self.scalar("SELECT COUNT(*) FROM UGM_ROUTINE_EXECUTIONS WHERE STATUS='SUCCESS' AND FL_COMPLETES_ACTIVITY=1"), 1)
+        self.assertEqual(self.scalar('SELECT COUNT(*) FROM FIXED_INCOME_BROKER_DATA WHERE DT_REF=?', (self.service.today(),)), 1)
+
+    def test_legacy_batch_without_execution_tag_can_be_replaced_using_exact_snapshot(self):
+        first = self.proposal()
+        self.service.confirm_action(first['ID_EXECUTION'], 'Alice')
+        self.execute('UPDATE FIXED_INCOME_BROKER_DATA SET ID_ROUTINE_EXECUTION=NULL')
+        replacement = self.proposal()
+        self.assertEqual(self.service.confirm_action(replacement['ID_EXECUTION'], 'Alice')['STATUS'], 'SUCCESS')
+        self.assertEqual(self.scalar('SELECT COUNT(*) FROM FIXED_INCOME_BROKER_DATA'), 2)
+        self.assertEqual(self.scalar('SELECT ID_ROUTINE_EXECUTION FROM FIXED_INCOME_BROKER_DATA WHERE DT_REF=?', (self.service.today(),)), replacement['ID_EXECUTION'])
+
+    def test_ambiguous_legacy_matches_do_not_delete_any_quote(self):
+        first = self.proposal()
+        self.service.confirm_action(first['ID_EXECUTION'], 'Alice')
+        self.execute('UPDATE FIXED_INCOME_BROKER_DATA SET ID_ROUTINE_EXECUTION=NULL')
+        columns = ','.join(r['name'] for r in self.execute('PRAGMA table_info(FIXED_INCOME_BROKER_DATA)'))
+        self.execute(f'INSERT INTO FIXED_INCOME_BROKER_DATA({columns}) SELECT {columns} FROM FIXED_INCOME_BROKER_DATA WHERE DT_REF=?', (self.service.today(),))
+        replacement = self.proposal()
+        result = self.service.confirm_action(replacement['ID_EXECUTION'], 'Alice')
+        self.assertEqual(result['STATUS'], 'FAILED')
+        self.assertIn('segurança', result['ERROR_MESSAGE'])
+        self.assertEqual(self.scalar('SELECT COUNT(*) FROM FIXED_INCOME_BROKER_DATA'), 3)
+        self.assertEqual(self.service.get_activity_completion('NTNB_RUN', 'NTNB_RUN:DEFAULT')['ID_EXECUTION'], first['ID_EXECUTION'])
+
+    def test_ntnf_replacement_rechecks_derived_rates_before_deleting_original(self):
+        calculated = {'reference_rate': 0.13, 'rate': 0.131}
+        with patch('services.routine_tools._DI_CURVE_PROVIDER', return_value={'curve': True}), \
+                patch('services.routine_tools._NTNF_RATE_CALCULATOR', side_effect=lambda **_: dict(calculated)):
+            args = {'source': 'XP', 'rows': [{'NM_SECURITY': 'NTN-F Jan-29', 'SIDE': 'Bid', 'SPREAD_QUOTE': 10}]}
+            first = self.service.prepare_action('NTNF_RUN', 'Alice', 'save_quotes', args)
+            self.service.confirm_action(first['ID_EXECUTION'], 'Alice')
+            replacement = self.service.prepare_action('NTNF_RUN', 'Alice', 'save_quotes', args)
+            calculated.update(reference_rate=0.14, rate=0.141)
+            pending = self.service.confirm_action(replacement['ID_EXECUTION'], 'Alice')
+            self.assertEqual(pending['STATUS'], 'PENDING_REVIEW')
+            self.assertEqual(pending['RESULT_JSON']['replacement']['execution_id'], first['ID_EXECUTION'])
+            self.assertEqual(self.scalar('SELECT TX_QUOTE FROM FIXED_INCOME_BROKER_DATA WHERE ID_ROUTINE_EXECUTION=?', (first['ID_EXECUTION'],)), 0.131)
+            self.assertEqual(self.service.confirm_action(replacement['ID_EXECUTION'], 'Alice')['STATUS'], 'SUCCESS')
+            self.assertEqual(self.scalar('SELECT TX_QUOTE FROM FIXED_INCOME_BROKER_DATA WHERE ID_ROUTINE_EXECUTION=?', (replacement['ID_EXECUTION'],)), 0.141)
+
     def test_failed_and_cancelled_actions_allow_retry_and_new_day_has_own_completion(self):
         cancelled = self.proposal()
         self.service.cancel_action(cancelled["ID_EXECUTION"], "Alice")
@@ -1179,8 +1481,8 @@ class RoutineTests(unittest.TestCase):
         self.execute("DROP TRIGGER fail_single_action")
         success = self.proposal()
         self.service.confirm_action(success["ID_EXECUTION"], "Alice")
-        with self.assertRaisesRegex(ValueError, "já foi concluída"):
-            self.proposal()
+        replacement = self.proposal()
+        self.assertEqual(replacement['ID_REPLACED_EXECUTION'], success['ID_EXECUTION'])
         self.now += timedelta(days=1)
         next_day = self.proposal()
         self.service.confirm_action(next_day["ID_EXECUTION"], "Alice")

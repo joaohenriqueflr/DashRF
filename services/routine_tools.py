@@ -5,12 +5,14 @@ execution record share one SQLite transaction. Rates use the existing database's
 decimal convention (0.07 = 7%); NTN-F source spreads are in basis points.
 """
 
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from email import policy
 from email.parser import BytesParser
 import csv
 import io
+import json
 import math
 from pathlib import Path
 import re
@@ -22,6 +24,8 @@ SAO_PAULO = ZoneInfo("America/Sao_Paulo")
 MAX_IMPORT_ROWS = 5000
 MAX_FILE_BYTES = 10 * 1024 * 1024
 QUOTE_COLUMNS = ["NM_SECURITY", "SIDE", "TX_QUOTE", "VL_QUOTE", "TS_REF", "SPREAD_QUOTE", "TX_DI_REF", "TX_SPREAD"]
+QUOTE_STORAGE_COLUMNS = ("DT_REF", "ID_SECURITY", "NM_SECURITY", "NM_SOURCE", "NM_BROKER", "SIDE",
+                         "TX_QUOTE", "VL_QUOTE", "DT_INPUT", "USR_INPUT", "TS_REF", "SPREAD_QUOTE", "TX_DI_REF", "TX_SPREAD")
 DEBTOR_COLUMNS = ["ID_CLIENT", "NR_DAYS", "NM_RESP_GWM", "DESCR", "FL_RESOLVED"]
 
 
@@ -35,6 +39,8 @@ class ToolSpec:
     execute: Callable
     # Derived values that must be shown again if validation changes the preview.
     review_fields: tuple = ()
+    # Optional atomic batch replacement. The executor owns confirmation/scope.
+    replace: Callable = None
 
 
 # ---- Generic SQLite tools and validation -------------------------------------
@@ -49,9 +55,11 @@ def ensure_operational_schema(conn):
         conn.execute("ALTER TABLE UGM_DEVEDORES RENAME TO UGM_ROUTINES_DEVEDORES")
     broker_columns = {row[1] for row in conn.execute("PRAGMA table_info(FIXED_INCOME_BROKER_DATA)")}
     if broker_columns:
-        for name, kind in (("TS_REF", "TEXT"), ("SPREAD_QUOTE", "REAL"), ("TX_DI_REF", "REAL"), ("TX_SPREAD", "REAL")):
+        for name, kind in (("TS_REF", "TEXT"), ("SPREAD_QUOTE", "REAL"), ("TX_DI_REF", "REAL"), ("TX_SPREAD", "REAL"),
+                           ("ID_ROUTINE_EXECUTION", "INTEGER")):
             if name not in broker_columns:
                 conn.execute(f'ALTER TABLE FIXED_INCOME_BROKER_DATA ADD COLUMN "{name}" {kind}')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_broker_routine_execution ON FIXED_INCOME_BROKER_DATA(ID_ROUTINE_EXECUTION)')
     conn.execute("""CREATE TABLE IF NOT EXISTS UGM_ROUTINES_DEVEDORES (
         DT_REF TEXT NOT NULL,
         ID_CLIENT TEXT NOT NULL,
@@ -59,12 +67,27 @@ def ensure_operational_schema(conn):
         NM_RESP_GWM TEXT NOT NULL,
         DESCR TEXT NOT NULL DEFAULT '',
         FL_RESOLVED INTEGER NOT NULL DEFAULT 1 CHECK (FL_RESOLVED IN (0, 1)),
+        ID_ROUTINE_EXECUTION INTEGER,
         PRIMARY KEY (DT_REF, ID_CLIENT)
     )""")
     expected = {"DT_REF", *DEBTOR_COLUMNS}
     actual = {row[1] for row in conn.execute("PRAGMA table_info(UGM_ROUTINES_DEVEDORES)")}
     if not expected.issubset(actual):
         raise ValueError("UGM_ROUTINES_DEVEDORES has an incompatible schema; migrate it explicitly before enabling routines.")
+    if 'ID_ROUTINE_EXECUTION' not in actual:
+        conn.execute('ALTER TABLE UGM_ROUTINES_DEVEDORES ADD COLUMN ID_ROUTINE_EXECUTION INTEGER')
+        if _table_exists(conn, 'UGM_ROUTINE_EXECUTIONS'):
+            # Older cases have a natural account/day key. Assign an owner only
+            # when exactly one surviving import contains that key.
+            conn.execute("""UPDATE UGM_ROUTINES_DEVEDORES SET ID_ROUTINE_EXECUTION=(
+                SELECT CASE WHEN COUNT(DISTINCT e.ID_EXECUTION)=1 THEN MIN(e.ID_EXECUTION) END
+                FROM UGM_ROUTINE_EXECUTIONS e, json_each(e.INPUT_JSON,'$.rows') r
+                WHERE e.NM_ACTION='import_debtors' AND e.STATUS='SUCCESS'
+                AND e.DT_REF=UGM_ROUTINES_DEVEDORES.DT_REF
+                AND json_extract(r.value,'$.ID_CLIENT')=UGM_ROUTINES_DEVEDORES.ID_CLIENT
+                AND NOT EXISTS(SELECT 1 FROM UGM_ROUTINE_EXECUTIONS replacement
+                    WHERE replacement.ID_REPLACED_EXECUTION=e.ID_EXECUTION AND replacement.STATUS='SUCCESS'))""")
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_debtor_routine_execution ON UGM_ROUTINES_DEVEDORES(ID_ROUTINE_EXECUTION)')
     duplicate = conn.execute("SELECT 1 FROM UGM_ROUTINES_DEVEDORES GROUP BY DT_REF, ID_CLIENT HAVING COUNT(*) > 1 LIMIT 1").fetchone()
     if duplicate:
         raise ValueError("UGM_ROUTINES_DEVEDORES has multiple cases per client/day; resolve the data contract before enabling imports.")
@@ -380,12 +403,61 @@ def _quote_preview(conn, args, context):
     return {"kind": "import", "rows": args["rows"], "columns": QUOTE_COLUMNS, "source": args["source"], "warnings": warnings}
 
 
+def _quote_storage_values(args, context, row):
+    return (context["dt_ref"], row["ID_SECURITY"], row["NM_SECURITY"], "Run", args["source"], row["SIDE"],
+            row["TX_QUOTE"], row.get("VL_QUOTE"), context["dt_ref"], context["username"], row["TS_REF"],
+            row.get("SPREAD_QUOTE"), row.get("TX_DI_REF"), row.get("TX_SPREAD"))
+
+
+def delete_quote_batch(conn, execution):
+    """Delete exactly one confirmed batch, including unambiguously matched older rows.
+
+    Older imports have no execution ID on their quote rows. Match their complete
+    stored snapshot and refuse ambiguous matches instead of deleting by date,
+    instrument or broker, which would also affect other activities.
+    """
+    args = json.loads(execution["INPUT_JSON"])
+    rows = args.get("rows", [])
+    if not rows:
+        raise ValueError("A run anterior não possui dados suficientes para uma substituição segura.")
+    execution_id = execution["ID_EXECUTION"]
+    tagged = conn.execute('SELECT COUNT(*) FROM FIXED_INCOME_BROKER_DATA WHERE ID_ROUTINE_EXECUTION=?', (execution_id,)).fetchone()[0]
+    if tagged != len(rows):
+        if tagged:
+            raise ValueError("Os registros da run anterior foram alterados. Revise a base antes de substituir.")
+        context = {"dt_ref": execution["DT_REF"], "username": execution["USERNAME"]}
+        expected = Counter(_quote_storage_values(args, context, row) for row in rows)
+        # A matching snapshot in another old execution makes ownership uncertain.
+        for other in conn.execute("""SELECT * FROM UGM_ROUTINE_EXECUTIONS WHERE DT_REF=? AND USERNAME=?
+                AND NM_ACTION='save_quotes' AND STATUS='SUCCESS' AND ID_EXECUTION!=?
+                AND NOT EXISTS (SELECT 1 FROM UGM_ROUTINE_EXECUTIONS replacement
+                    WHERE replacement.ID_REPLACED_EXECUTION=UGM_ROUTINE_EXECUTIONS.ID_EXECUTION AND replacement.STATUS='SUCCESS')
+                AND NOT EXISTS (SELECT 1 FROM FIXED_INCOME_BROKER_DATA quote
+                    WHERE quote.ID_ROUTINE_EXECUTION=UGM_ROUTINE_EXECUTIONS.ID_EXECUTION)""",
+                (execution["DT_REF"], execution["USERNAME"], execution_id)):
+            other_args = json.loads(other["INPUT_JSON"])
+            if not other_args.get("source"):
+                continue
+            if any(_quote_storage_values(other_args, context, row) in expected for row in other_args.get("rows", [])):
+                raise ValueError("Não foi possível identificar com segurança os dados da run anterior; nenhuma cotação foi excluída.")
+        where = ' AND '.join(f'{name} IS ?' for name in QUOTE_STORAGE_COLUMNS)
+        row_ids = []
+        for values, count in expected.items():
+            matches = conn.execute(f'SELECT rowid FROM FIXED_INCOME_BROKER_DATA WHERE ID_ROUTINE_EXECUTION IS NULL AND {where}', values).fetchall()
+            if len(matches) != count:
+                raise ValueError("Não foi possível identificar com segurança os dados da run anterior; nenhuma cotação foi excluída.")
+            row_ids.extend(row[0] for row in matches)
+        conn.executemany('UPDATE FIXED_INCOME_BROKER_DATA SET ID_ROUTINE_EXECUTION=? WHERE rowid=?',
+                         [(execution_id, row_id) for row_id in row_ids])
+    conn.execute('DELETE FROM FIXED_INCOME_BROKER_DATA WHERE ID_ROUTINE_EXECUTION=?', (execution_id,))
+    return len(rows)
+
+
 def _quote_execute(conn, args, context):
     conn.executemany("""INSERT INTO FIXED_INCOME_BROKER_DATA
-        (DT_REF,ID_SECURITY,NM_SECURITY,NM_SOURCE,NM_BROKER,SIDE,TX_QUOTE,VL_QUOTE,DT_INPUT,USR_INPUT,TS_REF,SPREAD_QUOTE,TX_DI_REF,TX_SPREAD)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", [
-            (context["dt_ref"], row["ID_SECURITY"], row["NM_SECURITY"], "Run", args["source"], row["SIDE"], row["TX_QUOTE"], row.get("VL_QUOTE"),
-             context["dt_ref"], context["username"], row["TS_REF"], row.get("SPREAD_QUOTE"), row.get("TX_DI_REF"), row.get("TX_SPREAD"))
+        (DT_REF,ID_SECURITY,NM_SECURITY,NM_SOURCE,NM_BROKER,SIDE,TX_QUOTE,VL_QUOTE,DT_INPUT,USR_INPUT,TS_REF,SPREAD_QUOTE,TX_DI_REF,TX_SPREAD,ID_ROUTINE_EXECUTION)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", [
+            (*_quote_storage_values(args, context, row), context["execution_id"])
             for row in args["rows"]])
     return {"kind": "query", "source": "FIXED_INCOME_BROKER_DATA", "count": len(args["rows"]), "message": "Quotes saved.", "rows": args["rows"]}
 
@@ -566,14 +638,16 @@ def _debtors_validate(conn, args, context):
     _object(args, {"rows"})
     normalized = []
     seen = set()
+    previous = context.get('replaced_execution')
+    replaceable = {row['ID_CLIENT'] for row in debtor_batch_rows(conn, previous)} if previous else set()
     for i, row in enumerate(_rows(args), 1):
         _object(row, DEBTOR_COLUMNS)
         client = _client(row.get("ID_CLIENT"))
         if client in seen:
             raise ValueError(f"Row {i}: the client occurs more than once in this import.")
         seen.add(client)
-        if conn.execute("SELECT 1 FROM UGM_ROUTINES_DEVEDORES WHERE DT_REF = ? AND ID_CLIENT = ?", (context["dt_ref"], client)).fetchone():
-            raise ValueError(f"Client {client} already has a case today. Use update_debtor to append information.")
+        if client not in replaceable and conn.execute("SELECT 1 FROM UGM_ROUTINES_DEVEDORES WHERE DT_REF = ? AND ID_CLIENT = ?", (context["dt_ref"], client)).fetchone():
+            raise ValueError(f"Client {client} already has a case today outside this batch. Use update_debtor to propose a correction.")
         normalized.append({"ID_CLIENT": client,
                            "NR_DAYS": _integer(row.get("NR_DAYS"), "NR_DAYS", minimum=0),
                            "NM_RESP_GWM": _text(row.get("NM_RESP_GWM"), "NM_RESP_GWM", limit=200),
@@ -583,25 +657,81 @@ def _debtors_validate(conn, args, context):
 
 
 def _debtors_preview(conn, args, context):
-    return {"kind": "import", "rows": args["rows"], "columns": DEBTOR_COLUMNS, "source": "UGM_ROUTINES_DEVEDORES", "warnings": ["FL_RESOLVED: 0 = resolved today; 1 = still a debtor."]}
+    result = {"kind": "import", "rows": args["rows"], "columns": DEBTOR_COLUMNS, "source": "UGM_ROUTINES_DEVEDORES", "warnings": ["FL_RESOLVED: 0 = resolved today; 1 = still a debtor."]}
+    if context.get('replaced_execution'):
+        result['current'] = debtor_batch_rows(conn, context['replaced_execution'])
+    return result
+
+
+def debtor_batch_rows(conn, execution):
+    """Return just this import's cases, including subsequently corrected keys."""
+    original = json.loads(execution['INPUT_JSON']).get('rows', [])
+    if not original:
+        raise ValueError('O lote anterior não possui registros identificáveis para substituição.')
+    fields = ','.join(DEBTOR_COLUMNS)
+    rows = _fetch(conn, f'SELECT {fields} FROM UGM_ROUTINES_DEVEDORES WHERE DT_REF=? AND ID_ROUTINE_EXECUTION=? ORDER BY ID_CLIENT',
+                  (execution['DT_REF'], execution['ID_EXECUTION']))
+    if rows:
+        if len(rows) != len(original):
+            raise ValueError('O lote anterior foi alterado. Revise os registros antes de substituir.')
+        return rows
+    rows = []
+    for item in original:
+        row = conn.execute(f'SELECT {fields},ID_ROUTINE_EXECUTION FROM UGM_ROUTINES_DEVEDORES WHERE DT_REF=? AND ID_CLIENT=?',
+                           (execution['DT_REF'], item['ID_CLIENT'])).fetchone()
+        if row is None or row['ID_ROUTINE_EXECUTION'] is not None:
+            raise ValueError('Não foi possível identificar com segurança os registros do lote anterior.')
+        ambiguous = conn.execute("""SELECT 1 FROM UGM_ROUTINE_EXECUTIONS e, json_each(e.INPUT_JSON,'$.rows') r
+            WHERE e.NM_ACTION='import_debtors' AND e.STATUS='SUCCESS' AND e.DT_REF=? AND e.ID_EXECUTION!=?
+            AND json_extract(r.value,'$.ID_CLIENT')=?
+            AND NOT EXISTS(SELECT 1 FROM UGM_ROUTINE_EXECUTIONS replacement
+                WHERE replacement.ID_REPLACED_EXECUTION=e.ID_EXECUTION AND replacement.STATUS='SUCCESS') LIMIT 1""",
+            (execution['DT_REF'], execution['ID_EXECUTION'], item['ID_CLIENT'])).fetchone()
+        if ambiguous:
+            raise ValueError('Não foi possível identificar com segurança os registros do lote anterior.')
+        rows.append({key: row[key] for key in DEBTOR_COLUMNS})
+    return sorted(rows, key=lambda row: row['ID_CLIENT'])
+
+
+def delete_debtor_batch(conn, execution):
+    rows = debtor_batch_rows(conn, execution)
+    conn.executemany('DELETE FROM UGM_ROUTINES_DEVEDORES WHERE DT_REF=? AND ID_CLIENT=?',
+                     [(execution['DT_REF'], row['ID_CLIENT']) for row in rows])
+    return len(rows)
 
 
 def _debtors_execute(conn, args, context):
-    conn.executemany("""INSERT INTO UGM_ROUTINES_DEVEDORES (DT_REF,ID_CLIENT,NR_DAYS,NM_RESP_GWM,DESCR,FL_RESOLVED)
-        VALUES (?,?,?,?,?,?)""", [(context["dt_ref"], row["ID_CLIENT"], row["NR_DAYS"], row["NM_RESP_GWM"], row["DESCR"], row["FL_RESOLVED"]) for row in args["rows"]])
-    return {"kind": "query", "source": "UGM_ROUTINES_DEVEDORES", "count": len(args["rows"]), "message": "Debtor cases imported."}
+    conn.executemany("""INSERT INTO UGM_ROUTINES_DEVEDORES (DT_REF,ID_CLIENT,NR_DAYS,NM_RESP_GWM,DESCR,FL_RESOLVED,ID_ROUTINE_EXECUTION)
+        VALUES (?,?,?,?,?,?,?)""", [(context["dt_ref"], row["ID_CLIENT"], row["NR_DAYS"], row["NM_RESP_GWM"], row["DESCR"], row["FL_RESOLVED"], context['execution_id']) for row in args["rows"]])
+    return {"kind": "query", "source": "UGM_ROUTINES_DEVEDORES", "count": len(args["rows"]), "rows": args['rows'], "message": "Debtor cases imported."}
 
 
 def _update_validate(conn, args, context):
-    _object(args, {"client_id", "description", "resolved"})
+    _object(args, {"client_id", "description", "resolved", "nr_days", "responsible", "case_description", "new_client_id"})
     client = _client(args.get("client_id"))
-    description = _text(args.get("description"), "description", limit=20000)
+    if not set(args) - {'client_id'}:
+        raise ValueError('Informe pelo menos um campo para corrigir.')
+    if 'description' in args and 'case_description' in args:
+        raise ValueError('Escolha acrescentar uma observação ou substituir a descrição, em propostas separadas.')
     if "resolved" in args and not isinstance(args["resolved"], bool):
         raise ValueError("resolved must be true or false.")
     row = conn.execute("SELECT 1 FROM UGM_ROUTINES_DEVEDORES WHERE DT_REF = ? AND ID_CLIENT = ?", (context["dt_ref"], client)).fetchone()
     if row is None:
         raise ValueError("No debtor case matches this exact account and operational date. Query the cases to clarify the client.")
-    result = {"client_id": client, "description": description}
+    result = {"client_id": client}
+    if 'description' in args:
+        result['description'] = _text(args['description'], 'description', limit=20000)
+    if 'case_description' in args:
+        result['case_description'] = _text(args['case_description'], 'case_description', optional=True, limit=20000)
+    if 'nr_days' in args:
+        result['nr_days'] = _integer(args['nr_days'], 'nr_days', minimum=0)
+    if 'responsible' in args:
+        result['responsible'] = _text(args['responsible'], 'responsible', limit=200)
+    if 'new_client_id' in args:
+        target = _client(args['new_client_id'])
+        if target != client and conn.execute('SELECT 1 FROM UGM_ROUTINES_DEVEDORES WHERE DT_REF=? AND ID_CLIENT=?', (context['dt_ref'], target)).fetchone():
+            raise ValueError('A nova conta já possui um caso nesta data. Nenhum registro foi alterado.')
+        result['new_client_id'] = target
     if "resolved" in args:
         result["resolved"] = args["resolved"]
     return result
@@ -609,25 +739,31 @@ def _update_validate(conn, args, context):
 
 def _update_preview(conn, args, context):
     current = _fetch(conn, "SELECT ID_CLIENT,NR_DAYS,NM_RESP_GWM,DESCR,FL_RESOLVED FROM UGM_ROUTINES_DEVEDORES WHERE DT_REF = ? AND ID_CLIENT = ?", (context["dt_ref"], args["client_id"]))[0]
-    proposed = {"description": args["description"]}
-    if "resolved" in args:
-        proposed["resolved"] = args["resolved"]
+    proposed = {key: value for key, value in args.items() if key != 'client_id'}
     return {"kind": "update", "current": current, "proposed": proposed, "rows": [proposed], "columns": list(proposed), "fields": list(proposed),
-            "warnings": ["The description will be appended with a timestamp. Existing history is preserved."]}
+            "warnings": ["The description will be appended with a timestamp. Existing history is preserved." if 'description' in args else
+                         "Correção dos campos informados somente após confirmação. Os valores anteriores permanecem no log de execução."]}
 
 
 def _update_execute(conn, args, context):
-    addition = f"[{_now(context).strftime('%H:%M:%S')} {context['username']}] {args['description']}"
-    if "resolved" in args:
-        cursor = conn.execute("""UPDATE UGM_ROUTINES_DEVEDORES SET DESCR = CASE WHEN COALESCE(DESCR,'') = '' THEN ? ELSE DESCR || char(10) || ? END,
-            FL_RESOLVED = ? WHERE DT_REF = ? AND ID_CLIENT = ?""", (addition, addition, 0 if args["resolved"] else 1, context["dt_ref"], args["client_id"]))
-    else:
-        cursor = conn.execute("""UPDATE UGM_ROUTINES_DEVEDORES SET DESCR = CASE WHEN COALESCE(DESCR,'') = '' THEN ? ELSE DESCR || char(10) || ? END
-            WHERE DT_REF = ? AND ID_CLIENT = ?""", (addition, addition, context["dt_ref"], args["client_id"]))
+    assignments, values = [], []
+    for key, column in (('nr_days', 'NR_DAYS'), ('responsible', 'NM_RESP_GWM'), ('case_description', 'DESCR'), ('new_client_id', 'ID_CLIENT')):
+        if key in args:
+            assignments.append(f'{column}=?')
+            values.append(args[key])
+    if 'description' in args:
+        addition = f"[{_now(context).strftime('%H:%M:%S')} {context['username']}] {args['description']}"
+        assignments.append("DESCR=CASE WHEN COALESCE(DESCR,'')='' THEN ? ELSE DESCR || char(10) || ? END")
+        values.extend([addition, addition])
+    if 'resolved' in args:
+        assignments.append('FL_RESOLVED=?')
+        values.append(0 if args['resolved'] else 1)
+    cursor = conn.execute('UPDATE UGM_ROUTINES_DEVEDORES SET '+','.join(assignments)+' WHERE DT_REF=? AND ID_CLIENT=?',
+                          [*values, context['dt_ref'], args['client_id']])
     if cursor.rowcount != 1:
         raise ValueError("The update must affect exactly one client case.")
     return {"kind": "query", "source": "UGM_ROUTINES_DEVEDORES", "count": 1, "message": "Client case updated.",
-            "rows": _fetch(conn, "SELECT * FROM UGM_ROUTINES_DEVEDORES WHERE DT_REF = ? AND ID_CLIENT = ?", (context["dt_ref"], args["client_id"]))}
+            "rows": _fetch(conn, "SELECT * FROM UGM_ROUTINES_DEVEDORES WHERE DT_REF = ? AND ID_CLIENT = ?", (context["dt_ref"], args.get('new_client_id', args['client_id'])))}
 
 
 def _query_debtors_validate(conn, args, context):
@@ -701,15 +837,17 @@ TOOLS = {
     "save_quotes": ToolSpec(True, "Propose market quote import for editable review. Saving requires the card's confirmation button. Use decimal rates.",
         _schema({"source": {"type": "string", "enum": ["XP", "Santander", "Ativa", "BGC", "xBridge"]},
                  "rows": {"type": "array", "items": QUOTE_ROW_SCHEMA, "minItems": 1, "maxItems": MAX_IMPORT_ROWS}}, ["source", "rows"]),
-        _quote_validate, _quote_preview, _quote_execute, review_fields=("TX_DI_REF", "TX_SPREAD")),
+        _quote_validate, _quote_preview, _quote_execute, review_fields=("TX_DI_REF", "TX_SPREAD"), replace=delete_quote_batch),
     "query_debtors": ToolSpec(False, "Query shared debtor cases for this date; FL_RESOLVED=1 means still a debtor.",
         _schema({"unresolved_only": {"type": "boolean"}, "client_id": {"type": "string"}}),
         _query_debtors_validate, _query_debtors, _query_debtors),
-    "import_debtors": ToolSpec(True, "Propose new daily debtor cases for editable review. Existing cases must be updated, never overwritten.",
+    "import_debtors": ToolSpec(True, "Propose daily debtor import or replacement of this activity's previous batch. Show current and proposed data; confirmation is mandatory. Use update_debtor for individual corrections.",
         _schema({"rows": {"type": "array", "items": DEBTOR_ROW_SCHEMA, "minItems": 1, "maxItems": MAX_IMPORT_ROWS}}, ["rows"]),
-        _debtors_validate, _debtors_preview, _debtors_execute),
-    "update_debtor": ToolSpec(True, "Propose appending a client update and optional resolution; exact client ID required. Button confirmation is mandatory.",
-        _schema({"client_id": {"type": "string"}, "description": {"type": "string"}, "resolved": {"type": "boolean"}}, ["client_id", "description"]),
+        _debtors_validate, _debtors_preview, _debtors_execute, replace=delete_debtor_batch),
+    "update_debtor": ToolSpec(True, "Propose correcting an exact debtor case, including after activity completion. description appends a note; case_description replaces the description. Supports days, responsible, resolved status and explicit account correction. Button confirmation is mandatory.",
+        _schema({"client_id": {"type": "string"}, "description": {"type": "string"}, "resolved": {"type": "boolean"},
+                 "nr_days": {"type": "integer", "minimum": 0}, "responsible": {"type": "string"},
+                 "case_description": {"type": "string"}, "new_client_id": {"type": "string"}}, ["client_id"]),
         _update_validate, _update_preview, _update_execute),
     "debtor_report": ToolSpec(False, "Prepare a same-day debtor closing report and email draft from shared SQLite data. Does not send email.",
         _schema({"unresolved_only": {"type": "boolean"}}), _report_validate, _debtor_report, _debtor_report),
