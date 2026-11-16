@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from chat_test_support import chat_completion
 from services.openai_client import AIConfigurationError, AIError, OpenAIService
 from services.prompts import PromptStore
 from services.ai_audit import AIRequestLog
@@ -37,19 +38,22 @@ class AIServiceTests(unittest.TestCase):
         self.store.save_version("screening", "extract", "Extract test fields", "model-from-sqlite",
                                 comment="DEVELOPMENT_NOTE_ONLY: used by the screening callback")
         client = Mock()
-        client.responses.create.return_value = SimpleNamespace(
-            status="completed", output=[SimpleNamespace(content=None)], output_text=json.dumps({"value": 123}),
-            model="test-model", id="response-123",
-            usage=SimpleNamespace(input_tokens=1200, output_tokens=75, total_tokens=1275),
+        client.chat.completions.create.return_value = chat_completion(
+            json.dumps({"value": 123}), model="test-model", response_id="response-123",
+            usage=SimpleNamespace(prompt_tokens=1200, completion_tokens=75, total_tokens=1275),
         )
         service = OpenAIService(client=client, database_path=self.db)
         result = service.extract(
             prompt=self.store.get_active("screening", "extract"),
             payload={"text": "RFQ"}, schema={"type": "object", "properties": {"value": {"type": "integer"}}, "required": ["value"], "additionalProperties": False}, schema_name="rfq_test",
         )
-        args = client.responses.create.call_args.kwargs
+        args = client.chat.completions.create.call_args.kwargs
         self.assertFalse(args["store"])
-        self.assertTrue(args["text"]["format"]["strict"])
+        self.assertTrue(args["response_format"]["json_schema"]["strict"])
+        self.assertEqual(args["messages"][0], {"role": "system", "content": "Extract test fields"})
+        self.assertEqual(json.loads(args["messages"][1]["content"]), {"text": "RFQ"})
+        for field in ("input", "instructions", "text", "max_output_tokens", "include"):
+            self.assertNotIn(field, args)
         self.assertNotIn("tools", args)
         self.assertNotIn("previous_response_id", args)
         self.assertEqual(args["metadata"]["feature"], "screening")
@@ -62,20 +66,20 @@ class AIServiceTests(unittest.TestCase):
         client = Mock()
         service = OpenAIService(client=client, database_path=self.db)
         kwargs = dict(prompt=self.store.get_active("screening", "extract"), payload={}, schema={}, schema_name="test")
-        client.responses.create.side_effect = RuntimeError("sensitive-provider-detail")
+        client.chat.completions.create.side_effect = RuntimeError("sensitive-provider-detail")
         with self.assertRaises(AIError) as error:
             service.extract(**kwargs)
         self.assertNotIn("sensitive-provider-detail", str(error.exception))
-        client.responses.create.side_effect = None
-        for status, output, text in [
-            ("incomplete", [], "{}"),
-            ("completed", [SimpleNamespace(content=[SimpleNamespace(type="refusal")])], ""),
-            ("completed", [], "not JSON"),
-            ("completed", [], "[]"),
+        client.chat.completions.create.side_effect = None
+        for finish_reason, refusal, text in [
+            ("length", None, "{}"),
+            ("stop", "Cannot process", ""),
+            ("stop", None, "not JSON"),
+            ("stop", None, "[]"),
         ]:
-            client.responses.create.return_value = SimpleNamespace(
-                status=status, output=output, output_text=text,
-                usage=SimpleNamespace(input_tokens=900, output_tokens=80, total_tokens=980),
+            client.chat.completions.create.return_value = chat_completion(
+                text, finish_reason=finish_reason, refusal=refusal,
+                usage=SimpleNamespace(prompt_tokens=900, completion_tokens=80, total_tokens=980),
             )
             with self.assertRaises(AIError) as error:
                 service.extract(**kwargs)
@@ -83,15 +87,28 @@ class AIServiceTests(unittest.TestCase):
 
     def test_missing_token_usage_is_unknown_and_reported_zero_is_preserved(self):
         client = Mock()
-        response = SimpleNamespace(status="completed", output=[], output_text='{}', model="model", id="id")
-        client.responses.create.return_value = response
+        response = chat_completion('{}', model="model", response_id="id")
+        client.chat.completions.create.return_value = response
         service = OpenAIService(client=client, database_path=self.db)
         kwargs = dict(prompt=self.store.get_active("screening", "extract"), payload={}, schema={}, schema_name="test")
         result = service.extract(**kwargs)
         self.assertEqual((result.input_tokens, result.output_tokens, result.total_tokens), (None, None, None))
-        response.usage = SimpleNamespace(input_tokens=0, output_tokens=0, total_tokens=0)
+        response.usage = SimpleNamespace(prompt_tokens=0, completion_tokens=0, total_tokens=0)
         result = service.extract(**kwargs)
         self.assertEqual((result.input_tokens, result.output_tokens, result.total_tokens), (0, 0, 0))
+
+    def test_missing_chat_choice_is_audited_as_invalid_without_losing_usage(self):
+        client = Mock()
+        response = self.response()
+        response.choices = []
+        client.chat.completions.create.return_value = response
+        service = OpenAIService(client=client, database_path=self.db)
+        with self.assertRaises(AIError) as raised:
+            service.extract(prompt=self.store.get_active("screening", "extract"), payload={}, schema={}, schema_name="test")
+        self.assertEqual(raised.exception.error_type, "InvalidResponse")
+        row, = self.audit_rows()
+        self.assertEqual((row["STATUS"], row["INPUT_TOKENS"], row["OUTPUT_TOKENS"]), ("invalid_response", 20, 3))
+        client.chat.completions.create.assert_called_once()
 
     def test_missing_model_and_instructions_fail_without_calling_sdk(self):
         from dataclasses import replace
@@ -100,7 +117,7 @@ class AIServiceTests(unittest.TestCase):
         for invalid in [replace(prompt, model=""), replace(prompt, instructions="")]:
             with self.assertRaises(AIConfigurationError):
                 OpenAIService(client=client, database_path=self.db).extract(prompt=invalid, payload={}, schema={}, schema_name="test")
-        client.responses.create.assert_not_called()
+        client.chat.completions.create.assert_not_called()
 
     def test_legacy_schema_adds_model_without_overwriting_prompts(self):
         path = Path(self.temp.name) / "legacy.db"
@@ -197,10 +214,9 @@ class AIServiceTests(unittest.TestCase):
             return [dict(row) for row in conn.execute("SELECT * FROM AI_REQUEST_LOG ORDER BY LOG_ID")]
 
     def response(self, **changes):
-        return SimpleNamespace(**{
-            "status": "completed", "output": [], "output_text": '{ "value": 7 }',
-            "model": "actual-model", "id": "response-test",
-            "usage": {"input_tokens": 20, "output_tokens": 3, "total_tokens": 23}, **changes,
+        return chat_completion(**{
+            "content": '{ "value": 7 }', "model": "actual-model", "response_id": "response-test",
+            "usage": {"prompt_tokens": 20, "completion_tokens": 3, "total_tokens": 23}, **changes,
         })
 
     def test_transport_commits_one_audit_row_before_each_actual_sdk_call(self):
@@ -215,12 +231,12 @@ class AIServiceTests(unittest.TestCase):
             self.assertEqual(json.loads(row["FULL_PROMPT"]), request)
             return self.response()
 
-        client.responses.create.side_effect = respond
+        client.chat.completions.create.side_effect = respond
         kwargs = dict(prompt=prompt, payload={"request_text": "original text", "requester_username": "Alice"},
                       schema={}, schema_name="test", audit_context={"form_type": "NTNB_RUN", "chat_message_id": 42})
         first, second = service.extract(**kwargs), service.extract(**kwargs)
         rows = self.audit_rows()
-        self.assertEqual(len(rows), client.responses.create.call_count)
+        self.assertEqual(len(rows), client.chat.completions.create.call_count)
         self.assertEqual(len(rows), 2)
         self.assertEqual([row["LOG_ID"] for row in rows], [first.log_id, second.log_id])
         self.assertNotEqual(first.log_id, second.log_id)
@@ -236,7 +252,9 @@ class AIServiceTests(unittest.TestCase):
     def test_conversation_tool_response_has_one_central_record_with_original_items(self):
         client = Mock()
         output = [{"type": "function_call", "name": "query_debtors", "call_id": "call-1", "arguments": "{}"}]
-        client.responses.create.return_value = self.response(output=output, output_text="")
+        client.chat.completions.create.return_value = self.response(content=None, finish_reason="tool_calls", tool_calls=[
+            {"id": "call-1", "type": "function", "function": {"name": "query_debtors", "arguments": "{}"}},
+        ])
         service = OpenAIService(client=client, database_path=self.db)
         result = service.converse(prompt=self.store.get_active("screening", "extract"),
                                   items=[{"role": "user", "content": "query the cases"}], tools=[],
@@ -245,22 +263,23 @@ class AIServiceTests(unittest.TestCase):
         self.assertEqual(row["LOG_ID"], result.log_id)
         self.assertEqual(json.loads(row["MODEL_OUTPUT"]), output)
         self.assertEqual((row["USERNAME"], row["PROMPT_TEXT"], row["CHAT_MESSAGE_ID"]), ("Bob", "query the cases", 10))
-        self.assertEqual(json.loads(row["FULL_PROMPT"]), client.responses.create.call_args.kwargs)
+        self.assertEqual(json.loads(row["FULL_PROMPT"]), client.chat.completions.create.call_args.kwargs)
 
     def test_all_provider_and_response_failures_keep_one_record_and_usage(self):
         client = Mock()
         service = OpenAIService(client=client, database_path=self.db)
         kwargs = dict(prompt=self.store.get_active("screening", "extract"), payload={}, schema={}, schema_name="test")
         cases = [
-            ({"status": "incomplete", "output_text": '{"value":'}, "failed", "IncompleteResponse"),
-            ({"output": [{"content": [{"type": "refusal", "refusal": "Cannot process"}]}], "output_text": ""}, "failed", "ModelRefusal"),
-            ({"output_text": "broken JSON"}, "invalid_response", "InvalidJSON"),
-            ({"output_text": "[]"}, "invalid_response", "InvalidJSONShape"),
+            ({"finish_reason": "length", "content": '{"value":'}, "failed", "IncompleteResponse"),
+            ({"refusal": "Cannot process", "content": None}, "failed", "ModelRefusal"),
+            ({"finish_reason": "content_filter", "content": None}, "failed", "ModelRefusal"),
+            ({"content": "broken JSON"}, "invalid_response", "InvalidJSON"),
+            ({"content": "[]"}, "invalid_response", "InvalidJSONShape"),
         ]
         for response_changes, status, error_type in cases:
             with self.subTest(error_type=error_type):
-                client.responses.create.return_value = self.response(**response_changes)
-                before = len(self.audit_rows()) if client.responses.create.call_count else 0
+                client.chat.completions.create.return_value = self.response(**response_changes)
+                before = len(self.audit_rows()) if client.chat.completions.create.call_count else 0
                 with self.assertRaises(AIError) as raised:
                     service.extract(**kwargs)
                 rows = self.audit_rows()
@@ -270,7 +289,7 @@ class AIServiceTests(unittest.TestCase):
                 self.assertEqual((row["STATUS"], row["ERROR_TYPE"]), (status, error_type))
                 self.assertEqual((row["INPUT_TOKENS"], row["OUTPUT_TOKENS"], row["TOTAL_TOKENS"]), (20, 3, 23))
                 self.assertIsNotNone(row["DT_FINISHED"])
-        client.responses.create.side_effect = RuntimeError("private provider detail")
+        client.chat.completions.create.side_effect = RuntimeError("private provider detail")
         with self.assertRaises(AIError) as raised:
             service.extract(**kwargs)
         row = self.audit_rows()[-1]
@@ -281,18 +300,18 @@ class AIServiceTests(unittest.TestCase):
 
     def test_audit_begin_failure_prevents_sdk_call_and_finish_failure_prevents_result_use(self):
         client = Mock()
-        client.responses.create.return_value = self.response()
+        client.chat.completions.create.return_value = self.response()
         service = OpenAIService(client=client, database_path=self.db)
         kwargs = dict(prompt=self.store.get_active("screening", "extract"), payload={}, schema={}, schema_name="test")
         with patch.object(AIRequestLog, "begin", side_effect=sqlite3.OperationalError("private DB detail")):
             with self.assertRaises(sqlite3.Error):
                 service.extract(**kwargs)
-        client.responses.create.assert_not_called()
+        client.chat.completions.create.assert_not_called()
         self.assertEqual(self.audit_rows(), [])
         with patch.object(AIRequestLog, "finish", side_effect=sqlite3.OperationalError("private DB detail")):
             with self.assertRaises(AIError) as raised:
                 service.extract(**kwargs)
-        self.assertEqual(client.responses.create.call_count, 1)
+        self.assertEqual(client.chat.completions.create.call_count, 1)
         row, = self.audit_rows()
         self.assertEqual(row["STATUS"], "running")
         self.assertEqual(raised.exception.error_type, "AuditPersistenceError")
@@ -354,7 +373,10 @@ class AIServiceTests(unittest.TestCase):
                 for node in ast.walk(ast.parse(path.read_text())):
                     if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                             and node.func.attr == "create" and isinstance(node.func.value, ast.Attribute)
-                            and node.func.value.attr == "responses"):
+                            and node.func.value.attr in {"responses", "completions"}):
+                        self.assertEqual(node.func.value.attr, "completions")
+                        self.assertIsInstance(node.func.value.value, ast.Attribute)
+                        self.assertEqual(node.func.value.value.attr, "chat")
                         call_sites.append(path.relative_to(root).as_posix())
         self.assertEqual(call_sites, ["services/openai_client.py"])
 

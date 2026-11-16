@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from chat_test_support import chat_completion
 from services.prompts import PromptStore
 from services.access import load_session_secret
 
@@ -546,9 +547,9 @@ class RFQAITests(unittest.TestCase):
     def sdk_service(self, data, *, raw=None, usage=None):
         """Exercise real transport/audit while replacing only the SDK network call."""
         client = Mock()
-        client.responses.create.return_value = SimpleNamespace(
-            status="completed", output=[], output_text=raw if raw is not None else json.dumps(data),
-            model="test-model", id="test-response", usage=usage,
+        client.chat.completions.create.return_value = chat_completion(
+            raw if raw is not None else json.dumps(data),
+            model="test-model", response_id="test-response", usage=usage,
         )
         service = self.page.OpenAIService(client=client, database_path=self.db)
         extract = service.extract
@@ -885,23 +886,23 @@ class RFQAITests(unittest.TestCase):
         output = json.dumps({"asset_class": "corporate", "is_rfq_request": True, "request_count": 1,
                              "has_conflicts": False, "trades": [{"fields": fields, "unresolved_fields": []}]})
         client = Mock()
-        client.responses.create.return_value = SimpleNamespace(
-            status="completed", output=[], output_text=output, model="returned-model", id="test-id",
-            usage=SimpleNamespace(input_tokens=2400, output_tokens=180, total_tokens=2580),
+        client.chat.completions.create.return_value = chat_completion(
+            output, model="returned-model", response_id="test-id",
+            usage=SimpleNamespace(prompt_tokens=2400, completion_tokens=180, total_tokens=2580),
         )
         service = self.page.OpenAIService(client=client, database_path=self.db)
         self.page.extract_rfq("corporate", "Comprar 500k TEST11", "Test User", service=service)
         row = self.audit_rows()[0]
         snapshot = json.loads(row["FULL_PROMPT"])
-        self.assertEqual(snapshot, client.responses.create.call_args.kwargs)
-        self.assertEqual(snapshot["instructions"], "Test-only corporate extraction")
+        self.assertEqual(snapshot, client.chat.completions.create.call_args.kwargs)
+        self.assertEqual(snapshot["messages"][0], {"role": "system", "content": "Test-only corporate extraction"})
         self.assertEqual(snapshot["model"], "sqlite-corporate-model")
-        payload = json.loads(snapshot["input"])
+        payload = json.loads(snapshot["messages"][1]["content"])
         self.assertEqual(payload["request_text"], "Comprar 500k TEST11")
         self.assertEqual(payload["requester_username"], "Test User")
         contract = payload["form_contract"]
         self.assertEqual(contract["field_definitions"]["security"]["options"], self.page.load_corporate_security_options())
-        self.assertEqual(snapshot["text"]["format"]["schema"], contract["output_schema"])
+        self.assertEqual(snapshot["response_format"]["json_schema"]["schema"], contract["output_schema"])
         self.assertEqual(row["MODEL_OUTPUT"], output)
         self.assertEqual((row["INPUT_TOKENS"], row["OUTPUT_TOKENS"], row["TOTAL_TOKENS"]), (2400, 180, 2580))
         self.assertNotIn("api_key", snapshot)
@@ -1028,7 +1029,7 @@ class RFQAITests(unittest.TestCase):
     def test_multiple_requests_warning_is_visible_in_the_ai_request_log(self):
         response = self.ai_dispatch("sovereign", {}, count=2, conflicts=True,
                                     text="compro b50 500k compro b40",
-                                    usage={"input_tokens": 1890, "output_tokens": 420, "total_tokens": 2310})
+                                    usage={"prompt_tokens": 1890, "completion_tokens": 420, "total_tokens": 2310})
         shown = response["rfq-ai-status-sovereign"]["children"]["props"]["children"]
         request = self.audit_rows()[0]
         self.assertIn("Conflicting details were found within a trade", shown)
@@ -1051,7 +1052,7 @@ class RFQAITests(unittest.TestCase):
             self.assertIsNone(row["DT_FINISHED"])
             raise APITimeoutError("Sensitive transport detail")
 
-        client.responses.create.side_effect = fail_request
+        client.chat.completions.create.side_effect = fail_request
         with self.assertRaises(self.page.AIError):
             self.page.extract_rfq("sovereign", "Buy LTN", "Test User", service=service)
         row = self.audit_rows()[0]
@@ -1064,10 +1065,9 @@ class RFQAITests(unittest.TestCase):
 
     def test_malformed_json_is_preserved_in_single_output_column(self):
         client = Mock()
-        client.responses.create.return_value = SimpleNamespace(
-            status="completed", output=[], output_text='{ "fields": unfinished',
-            model="returned-model", id="broken-response",
-            usage=SimpleNamespace(input_tokens=500, output_tokens=90, total_tokens=590),
+        client.chat.completions.create.return_value = chat_completion(
+            '{ "fields": unfinished', model="returned-model", response_id="broken-response",
+            usage=SimpleNamespace(prompt_tokens=500, completion_tokens=90, total_tokens=590),
         )
         service = self.page.OpenAIService(client=client, database_path=self.db)
         with self.assertRaises(self.page.AIError):
@@ -1081,9 +1081,9 @@ class RFQAITests(unittest.TestCase):
 
     def test_incomplete_model_response_still_logs_token_usage(self):
         client = Mock()
-        client.responses.create.return_value = SimpleNamespace(
-            status="incomplete", output=[], output_text='{"fields":', model="returned-model", id="partial",
-            usage=SimpleNamespace(input_tokens=321, output_tokens=4000, total_tokens=4321),
+        client.chat.completions.create.return_value = chat_completion(
+            '{"fields":', finish_reason="length", model="returned-model", response_id="partial",
+            usage=SimpleNamespace(prompt_tokens=321, completion_tokens=4000, total_tokens=4321),
         )
         with self.assertRaises(self.page.AIError):
             self.page.extract_rfq("corporate", "Buy 500k TEST11", "Test User", service=self.page.OpenAIService(client=client, database_path=self.db))
@@ -1095,7 +1095,7 @@ class RFQAITests(unittest.TestCase):
     def test_json_rejected_by_form_is_logged_before_error_is_returned(self):
         raw = '{\n  "unexpected": true\n}'
         service, _ = self.sdk_service({"unexpected": True}, raw=raw,
-                                      usage={"input_tokens": 1100, "output_tokens": 95, "total_tokens": 1195})
+                                      usage={"prompt_tokens": 1100, "completion_tokens": 95, "total_tokens": 1195})
         with self.assertRaises(self.page.AIError):
             self.page.extract_rfq("corporate", "Buy TEST11", "Test User", service=service)
         row = self.audit_rows()[0]
@@ -1108,7 +1108,7 @@ class RFQAITests(unittest.TestCase):
         with patch.object(self.page.AIRequestLog, "begin", side_effect=sqlite3.OperationalError("test database unavailable")):
             with self.assertRaises(sqlite3.Error):
                 self.page.extract_rfq("sovereign", "Buy LTN", "Test User", service=service)
-        client.responses.create.assert_not_called()
+        client.chat.completions.create.assert_not_called()
 
     def test_manual_maturity_change_does_not_reapply_old_ai_result(self):
         result = self.maturity_dispatch("LFT", "LTN 01/01/2028")
@@ -1188,7 +1188,7 @@ class RFQAITests(unittest.TestCase):
             {"direction": "Sell", "bond_name": "LFT", "maturity": "LFT 01/03/2029", "quantity": 25, "yield_limit": 12.5},
         ]
         response = self.ai_dispatch("sovereign", {}, trades=trades, text="buy 500k LTN 2028; sell 25q LFT 2029 12.5%",
-                                    usage={"input_tokens": 2000, "output_tokens": 500, "total_tokens": 2500})
+                                    usage={"prompt_tokens": 2000, "completion_tokens": 500, "total_tokens": 2500})
         self.service.extract.assert_called_once()
         draft = response["rfq-ai-result-sovereign"]["data"]
         self.assertEqual(len(draft["trades"]), 2)
@@ -1282,7 +1282,7 @@ class RFQAITests(unittest.TestCase):
              "security_text": "Hidden stale description", "requester": "Forged name"},
             {"direction": "Sell", "bond_type": "Banking Instruments", "security_text": "CDB Test Bank", "quantity": 25,
              "security": "TEST11", "yield_limit": 13},
-        ], usage={"input_tokens": 1500, "output_tokens": 400, "total_tokens": 1900})
+        ], usage={"prompt_tokens": 1500, "completion_tokens": 400, "total_tokens": 1900})
         self.service.extract.assert_called_once()
         draft = response["rfq-ai-result-corporate"]["data"]
         # Reproduce the browser's batched Apply/result notifications, in Apply-first order.

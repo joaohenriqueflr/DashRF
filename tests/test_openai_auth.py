@@ -9,6 +9,7 @@ from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
+from chat_test_support import chat_completion
 from services.openai_client import AIConfigurationError, AIError, OpenAIService
 from services.ai_audit import AIRequestLog
 from services.prompts import PromptStore
@@ -162,15 +163,15 @@ class OpenAIAuthenticationTests(unittest.TestCase):
         os.environ["OPENAI_API_KEY"] = "personal-key"
         store = PromptStore(self.db)
         store.seed("test", "extract", "Extract fields", "model")
-        self.ubs.responses.create.return_value = self.response()
-        self.personal.responses.create.return_value = self.response()
+        self.ubs.chat.completions.create.return_value = self.response()
+        self.personal.chat.completions.create.return_value = self.response()
         self.service = OpenAIService(database_path=self.db)
         self.request = dict(prompt=store.get_active("test", "extract"), payload={"text": "hello"},
                             schema={"type": "object"}, schema_name="test")
 
     @staticmethod
     def response():
-        return SimpleNamespace(status="completed", output=[], output_text='{"value": 7}', model="model", id="id")
+        return chat_completion('{"value": 7}', model="model", response_id="id")
 
     def audit_rows(self):
         with closing(sqlite3.connect(self.db)) as conn:
@@ -179,63 +180,63 @@ class OpenAIAuthenticationTests(unittest.TestCase):
 
     def test_gateway_fallback_has_committed_audits_and_no_secret_leaks(self):
         self.setup_request()
-        self.ubs.responses.create.side_effect = StatusFailure(503)
+        self.ubs.chat.completions.create.side_effect = StatusFailure(503)
 
         def personal_request(**kwargs):
             self.assertEqual([row["STATUS"] for row in self.audit_rows()], ["failed", "running"])
             return self.response()
 
-        self.personal.responses.create.side_effect = personal_request
+        self.personal.chat.completions.create.side_effect = personal_request
         result = self.service.extract(**self.request)
         rows = self.audit_rows()
         self.assertEqual([row["STATUS"] for row in rows], ["failed", "completed"])
         self.assertEqual(result.log_id, rows[1]["LOG_ID"])
-        self.assertEqual(self.ubs.responses.create.call_count, 1)
-        self.assertEqual(self.personal.responses.create.call_count, 1)
+        self.assertEqual(self.ubs.chat.completions.create.call_count, 1)
+        self.assertEqual(self.personal.chat.completions.create.call_count, 1)
         for secret in ["personal-key", "ubs-token", "broker.example.test", "gateway.example.test", "private-provider-details"]:
             self.assertNotIn(secret, json.dumps(rows))
 
     def test_connection_and_auth_failures_allow_one_fallback(self):
         self.setup_request()
         for error in [ConnectionFailure(), StatusFailure(401), StatusFailure(403), StatusFailure(408), StatusFailure(429)]:
-            self.ubs.responses.create.side_effect = error
+            self.ubs.chat.completions.create.side_effect = error
             self.service.extract(**self.request)
-        self.assertEqual(self.personal.responses.create.call_count, 5)
+        self.assertEqual(self.personal.chat.completions.create.call_count, 5)
 
     def test_bad_requests_and_invalid_outputs_do_not_fallback(self):
         self.setup_request()
         for error in [StatusFailure(400), StatusFailure(404), RuntimeError("private-details")]:
-            self.ubs.responses.create.side_effect = error
+            self.ubs.chat.completions.create.side_effect = error
             with self.assertRaises(AIError):
                 self.service.extract(**self.request)
-        self.ubs.responses.create.side_effect = None
-        self.ubs.responses.create.return_value.output_text = "invalid-json"
+        self.ubs.chat.completions.create.side_effect = None
+        self.ubs.chat.completions.create.return_value.choices[0].message.content = "invalid-json"
         with self.assertRaises(AIError):
             self.service.extract(**self.request)
-        self.personal.responses.create.assert_not_called()
+        self.personal.chat.completions.create.assert_not_called()
 
     def test_audit_failure_prevents_fallback(self):
         self.setup_request()
-        self.ubs.responses.create.side_effect = StatusFailure(503)
+        self.ubs.chat.completions.create.side_effect = StatusFailure(503)
         with patch.object(AIRequestLog, "finish", side_effect=sqlite3.OperationalError("private-db-detail")):
             with self.assertRaises(AIError) as raised:
                 self.service.extract(**self.request)
         self.assertEqual(raised.exception.error_type, "AuditPersistenceError")
-        self.personal.responses.create.assert_not_called()
+        self.personal.chat.completions.create.assert_not_called()
 
     def test_personal_failure_is_not_retried_and_no_key_disables_fallback(self):
         self.setup_request()
-        self.ubs.responses.create.side_effect = StatusFailure(503)
-        self.personal.responses.create.side_effect = ConnectionFailure()
+        self.ubs.chat.completions.create.side_effect = StatusFailure(503)
+        self.personal.chat.completions.create.side_effect = ConnectionFailure()
         with self.assertRaises(AIError):
             self.service.extract(**self.request)
         self.assertEqual([row["STATUS"] for row in self.audit_rows()], ["failed", "failed"])
-        self.personal.responses.create.assert_called_once()
-        self.personal.responses.create.reset_mock()
+        self.personal.chat.completions.create.assert_called_once()
+        self.personal.chat.completions.create.reset_mock()
         os.environ["OPENAI_API_KEY"] = ""
         with self.assertRaises(AIError):
             OpenAIService(database_path=self.db).extract(**self.request)
-        self.personal.responses.create.assert_not_called()
+        self.personal.chat.completions.create.assert_not_called()
 
 
 @unittest.skipUnless(importlib.util.find_spec("openai") and importlib.util.find_spec("httpx")
@@ -243,6 +244,9 @@ class OpenAIAuthenticationTests(unittest.TestCase):
                      "Install requirements-ai.txt with Python 3.10+ for SDK integration tests")
 class RealSDKAuthenticationTests(unittest.TestCase):
     def test_actual_sdk_uses_separate_credentials_and_audits_on_gateway_fallback(self):
+        from importlib.metadata import version
+        if int(version("openai").split(".")[0]) != 2:
+            self.skipTest("Install the OpenAI SDK 2.x version declared in requirements-ai.txt")
         import httpx
 
         with tempfile.TemporaryDirectory() as directory:
@@ -264,11 +268,11 @@ class RealSDKAuthenticationTests(unittest.TestCase):
                 sent.append((str(request.url), request.headers["authorization"]))
                 if request.url.host == "gateway.example.test":
                     return httpx.Response(503, request=request, json={"error": {"message": "unavailable"}})
-                self.assertEqual(str(request.url), "https://api.openai.com/v1/responses")
+                self.assertEqual(str(request.url), "https://api.openai.com/v1/chat/completions")
                 return httpx.Response(200, request=request, json={
-                    "id": "response-id", "created_at": 0, "object": "response", "status": "completed", "model": "model",
-                    "output": [{"id": "msg", "type": "message", "role": "assistant", "status": "completed",
-                                "content": [{"type": "output_text", "text": '{"value": 7}', "annotations": []}]}],
+                    "id": "chat-id", "created": 0, "object": "chat.completion", "model": "model",
+                    "choices": [{"index": 0, "finish_reason": "stop",
+                                 "message": {"role": "assistant", "content": '{"value": 7}'}}],
                 })
 
             # Stub the broker and HTTP send boundary; all SDK construction/parsing is real.
@@ -278,8 +282,8 @@ class RealSDKAuthenticationTests(unittest.TestCase):
                 try:
                     result = service.extract(prompt=store.get_active("test", "extract"), payload={}, schema={}, schema_name="test")
                     self.assertEqual(result.data, {"value": 7})
-                    self.assertEqual(sent, [("https://gateway.example.test/aiaas/v1/responses", "Bearer ubs-token"),
-                                            ("https://api.openai.com/v1/responses", "Bearer personal-key")])
+                    self.assertEqual(sent, [("https://gateway.example.test/aiaas/v1/chat/completions", "Bearer ubs-token"),
+                                            ("https://api.openai.com/v1/chat/completions", "Bearer personal-key")])
                     with closing(sqlite3.connect(root / "test.db")) as conn:
                         self.assertEqual(conn.execute("SELECT STATUS FROM AI_REQUEST_LOG ORDER BY LOG_ID").fetchall(),
                                          [("failed",), ("completed",)])

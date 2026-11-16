@@ -1,4 +1,4 @@
-"""Shared OpenAI Responses transport with mandatory per-request SQLite auditing."""
+"""Shared OpenAI Chat Completions transport with per-request SQLite auditing."""
 
 import json
 import logging
@@ -49,7 +49,7 @@ class StructuredResult:
 
 @dataclass(frozen=True)
 class ConversationResult:
-    """Full Responses items, including call IDs and opaque reasoning state."""
+    """Assistant messages and function-call events consumed by routine execution."""
 
     items: list
     output_text: str
@@ -65,12 +65,14 @@ def build_structured_request(*, prompt, payload, schema, schema_name):
     """The exact credential-free request body used by both transport and audit."""
     return {
         "model": (prompt.model or "").strip(),
-        "instructions": prompt.instructions,
-        "input": json.dumps(payload, ensure_ascii=False, allow_nan=False),
-        "text": {"format": {
-            "type": "json_schema", "name": schema_name, "schema": schema, "strict": True,
+        "messages": [
+            {"role": "system", "content": prompt.instructions},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False, allow_nan=False)},
+        ],
+        "response_format": {"type": "json_schema", "json_schema": {
+            "name": schema_name, "schema": schema, "strict": True,
         }},
-        "max_output_tokens": 4000,
+        "max_completion_tokens": 4000,
         "store": False,
         "metadata": {"feature": prompt.feature, "prompt_key": prompt.key,
                      "prompt_id": str(prompt.id), "prompt_version": str(prompt.version)},
@@ -82,8 +84,49 @@ def _field(value, name, default=None):
 
 
 def _output_items(response):
-    return [item.model_dump(mode="json", exclude_none=True) if hasattr(item, "model_dump")
-            else dict(item) for item in (_field(response, "output") or [])]
+    """Adapt Chat Completions messages to the routine engine's internal events."""
+    message = _field(_field(response, "choices")[0], "message")
+    output = []
+    content = _field(message, "content")
+    if content:
+        output.append({"type": "message", "role": "assistant",
+                       "content": [{"type": "output_text", "text": content}]})
+    for call in _field(message, "tool_calls") or []:
+        function = _field(call, "function")
+        call_id, name, arguments = _field(call, "id"), _field(function, "name"), _field(function, "arguments")
+        if (_field(call, "type") != "function" or not isinstance(call_id, str) or not call_id
+                or not isinstance(name, str) or not name or not isinstance(arguments, str)):
+            raise ValueError("Invalid function call in Chat Completions response.")
+        output.append({"type": "function_call", "call_id": call_id, "name": name, "arguments": arguments})
+    return output
+
+
+def _chat_messages(items):
+    """Translate internal routine events into Chat Completions conversation turns."""
+    messages = []
+    for item in items:
+        kind = _field(item, "type")
+        if kind == "reasoning":
+            # Older in-memory events have no Chat Completions equivalent.
+            continue
+        if kind == "function_call":
+            call = {"id": _field(item, "call_id"), "type": "function",
+                    "function": {"name": _field(item, "name"), "arguments": _field(item, "arguments")}}
+            if not messages or messages[-1]["role"] != "assistant":
+                messages.append({"role": "assistant", "content": None})
+            messages[-1].setdefault("tool_calls", []).append(call)
+        elif kind == "function_call_output":
+            messages.append({"role": "tool", "tool_call_id": _field(item, "call_id"), "content": _field(item, "output")})
+        else:
+            message = {name: _field(item, name) for name in ("role", "content", "tool_calls", "tool_call_id")
+                       if _field(item, name) is not None}
+            content = message.get("content")
+            if isinstance(content, list):
+                message["content"] = [{"type": "text", "text": _field(part, "text")}
+                                      if _field(part, "type") in {"input_text", "output_text"} else part
+                                      for part in content]
+            messages.append(message)
+    return messages
 
 
 def _request_context(prompt, payload, items, audit_context):
@@ -253,30 +296,31 @@ class OpenAIService:
         try:
             client = self._get_client(personal=True) if _personal_fallback else self._get_client()
             try:
-                response = client.responses.create(**request)
+                response = client.chat.completions.create(**request)
             except Exception as exc:
                 use_personal_fallback = not _personal_fallback and self._can_fallback(exc)
                 raise AIError("The AI service could not complete the request. Please try again.",
                               error_type=type(exc).__name__, log_id=log_id) from exc
-            details.update(output_text=_field(response, "output_text"),
-                           response_id=_field(response, "id"), model=_field(response, "model"),
+            details.update(response_id=_field(response, "id"), model=_field(response, "model"),
                            **_response_token_usage(response))
-            if not details["output_text"] and _field(response, "output"):
-                # Incomplete tool responses may have no aggregate output_text.
-                # Retain their original structured output for audit/recovery.
-                try:
-                    details["output_text"] = json.dumps(_output_items(response), ensure_ascii=False, allow_nan=False)
-                except (TypeError, ValueError):
-                    pass
-            if _field(response, "status") != "completed":
+            choices = _field(response, "choices") or []
+            if len(choices) != 1 or _field(choices[0], "message") is None:
+                raise AIError("The AI returned an unreadable response. Please try again.",
+                              error_type="InvalidResponse", **details)
+            choice = choices[0]
+            message = _field(choice, "message")
+            details["output_text"] = _field(message, "content")
+            if not details["output_text"] and _field(message, "tool_calls"):
+                # Preserve even partial tool responses for audit/recovery.
+                details["output_text"] = json.dumps(_output_items(response), ensure_ascii=False, allow_nan=False)
+            refusal = _field(message, "refusal")
+            if refusal or _field(choice, "finish_reason") == "content_filter":
+                details["output_text"] = refusal or details["output_text"]
+                raise AIError("The model could not process this request. Please try again.",
+                              error_type="ModelRefusal", **details)
+            if _field(choice, "finish_reason") not in {"stop", "tool_calls"}:
                 raise AIError("The AI response was incomplete. Please try again.",
                               error_type="IncompleteResponse", **details)
-            for item in _field(response, "output") or []:
-                for part in _field(item, "content") or []:
-                    if _field(part, "type") == "refusal":
-                        details["output_text"] = _field(part, "refusal") or details["output_text"]
-                        raise AIError("The model could not process this request. Please try again.",
-                                      error_type="ModelRefusal", **details)
             result = parse(response, details)
         except AIError as exc:
             exc.log_id = log_id
@@ -300,13 +344,16 @@ class OpenAIService:
         """Replay conversation through the same audited transport used by RFQ."""
         self._validate_prompt(prompt)
         request = {
-            "model": prompt.model.strip(), "instructions": prompt.instructions,
-            "input": items, "tools": tools, "parallel_tool_calls": False,
-            "include": ["reasoning.encrypted_content"], "store": False,
-            "max_output_tokens": 4000,
+            "model": prompt.model.strip(),
+            "messages": [{"role": "system", "content": prompt.instructions}, *_chat_messages(items)],
+            "store": False, "max_completion_tokens": 4000,
             "metadata": {"feature": prompt.feature, "prompt_key": prompt.key,
                          "prompt_id": str(prompt.id), "prompt_version": str(prompt.version)},
         }
+        if tools:
+            request.update(tools=[{"type": "function", "function": {key: value for key, value in tool.items() if key != "type"}}
+                                  if "function" not in tool else dict(tool) for tool in tools],
+                           parallel_tool_calls=False)
 
         def parse(response, details):
             try:
@@ -314,7 +361,8 @@ class OpenAIService:
             except (TypeError, ValueError) as exc:
                 raise AIError("The AI returned an unreadable response. Please try again.",
                               error_type="InvalidResponse", **details) from exc
-            return ConversationResult(output, _field(response, "output_text", ""), details["response_id"], details["model"],
+            content = _field(_field(response, "choices")[0], "message")
+            return ConversationResult(output, _field(content, "content") or "", details["response_id"], details["model"],
                                       **{name: details[name] for name in ("input_tokens", "output_tokens", "total_tokens", "log_id")})
 
         return self._request(prompt=prompt, request=request, parse=parse, items=items, audit_context=audit_context)
@@ -326,7 +374,7 @@ class OpenAIService:
 
         def parse(response, details):
             try:
-                data = json.loads(_field(response, "output_text"), parse_constant=_reject_json_constant)
+                data = json.loads(details["output_text"], parse_constant=_reject_json_constant)
             except (TypeError, ValueError) as exc:
                 raise AIError("The AI returned an unreadable result. Please try again.",
                               error_type="InvalidJSON", **details) from exc
@@ -334,7 +382,7 @@ class OpenAIService:
                 raise AIError("The AI returned an invalid result. Please try again.",
                               error_type="InvalidJSONShape", **details)
             return StructuredResult(data, details["model"], details["response_id"], prompt.id, prompt.version,
-                                    _field(response, "output_text"),
+                                    details["output_text"],
                                     **{name: details[name] for name in ("input_tokens", "output_tokens", "total_tokens", "log_id")})
 
         return self._request(prompt=prompt, request=request, parse=parse, payload=payload, audit_context=audit_context)
@@ -344,8 +392,8 @@ def _response_token_usage(response):
     """Read API-reported counts; missing usage is unknown rather than zero."""
     usage = _field(response, "usage")
     counts = {}
-    for name in ("input_tokens", "output_tokens", "total_tokens"):
-        value = _field(usage, name)
+    for name, api_name in (("input_tokens", "prompt_tokens"), ("output_tokens", "completion_tokens"), ("total_tokens", "total_tokens")):
+        value = _field(usage, api_name)
         counts[name] = value if type(value) is int and value >= 0 else None
     return counts
 

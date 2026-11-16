@@ -89,7 +89,7 @@ the system certificate store. The broker still uses the system certificate trust
 At home, filling in `OPENAI_API_KEY` is sufficient; the optional UBS packages are
 imported only when attempting UBS authentication. Both providers use the prompt's
 SQLite `MODEL` value, so choose a model identifier accepted by both environments
-when using fallback. The broker version and Responses API support must be checked
+when using fallback. The broker version and Chat Completions support must be checked
 in the work environment. See the official
 [OpenAI Python SDK configuration](https://developers.openai.com/api/reference/python).
 
@@ -132,7 +132,15 @@ FROM AI_PROMPTS
 WHERE FEATURE = 'rfq' AND FL_ACTIVE = 1;
 ```
 
-Choose a model supporting the Responses API and strict JSON Schema outputs.
+All requests use `client.chat.completions.create(...)` for both the UBS gateway
+and the personal fallback. Structured extraction sends system/user `messages`
+with a strict `response_format.json_schema`; routine conversations use Chat
+Completions function tools and `tool` messages. Results are read from
+`choices[0].message`; `prompt_tokens` and `completion_tokens` populate the existing
+input/output usage columns. Requests use `max_completion_tokens=4000` and do not
+send Responses-only parameters or encrypted reasoning state.
+
+Choose a model supporting Chat Completions and strict JSON Schema outputs.
 For versioned edits, the generic `PromptStore.save_version(feature, key,
 instructions, model)` method creates a new active row atomically and retains
 previous versions. Each API request carries the selected prompt ID/version in its
@@ -342,4 +350,4 @@ Additional checks verify formatted numeric controls, exact full-request snapshot
 AI warning persistence, visible manual validation alerts, transaction rollback, and
 token usage logging for successful and failed responses.
 
-Reference: [OpenAI Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs?api-mode=responses).
+Reference: [OpenAI Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs?api-mode=chat).

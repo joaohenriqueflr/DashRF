@@ -847,7 +847,7 @@ class RoutineService(RoutineActivities):
             response = self.ai_service.converse(prompt=prompt, items=items, tools=tools,
                 audit_context={"username": username, "form_type": routine_id, "text": text,
                                "chat_message_id": interaction_id})
-            # Tool pairs and opaque reasoning stay in this request's memory only.
+            # Tool-call pairs stay in this request's memory only.
             # Subsequent turns replay the readable, consolidated interaction log.
             items.extend(response.items)
             calls = [item for item in response.items if item.get("type") == "function_call"]

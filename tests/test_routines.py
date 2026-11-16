@@ -17,6 +17,7 @@ import unittest
 from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
+from chat_test_support import chat_completion
 from routine_test_support import single_ntnb_activity
 from services.prompts import PromptStore
 from services.openai_client import AIError, ConversationResult, OpenAIService, StructuredResult
@@ -335,15 +336,16 @@ class RoutineTests(unittest.TestCase):
 
     @staticmethod
     def api_response(text="", *, items=None, usage=None, status="completed", response_id="test-response"):
-        response = SimpleNamespace(status=status, output=items or [], output_text=text,
-                                   id=response_id, model="configured-routine-model")
-        if usage is not None:
-            response.usage = usage
-        return response
+        calls = [{"id": item["call_id"], "type": "function",
+                  "function": {"name": item["name"], "arguments": item["arguments"]}}
+                 for item in items or [] if item.get("type") == "function_call"]
+        finish_reason = "length" if status != "completed" else "tool_calls" if calls else "stop"
+        return chat_completion(text, tool_calls=calls or None, usage=usage, finish_reason=finish_reason,
+                               response_id=response_id, model="configured-routine-model")
 
     def mock_api(self, responses):
         client = Mock()
-        client.responses.create.side_effect = responses
+        client.chat.completions.create.side_effect = responses
         self.service.ai_service = OpenAIService(client=client, database_path=self.db)
         return client
 
@@ -390,9 +392,9 @@ class RoutineTests(unittest.TestCase):
         client = self.mock_api([
             self.api_response(items=[
                 {"type": "reasoning", "id": "opaque-reasoning-id", "summary": [], "encrypted_content": "private-opaque-content"}, call,
-            ], usage={"input_tokens": 100, "output_tokens": 10, "total_tokens": 110}, response_id="query-response"),
+            ], usage={"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110}, response_id="query-response"),
             self.api_response("Não há clientes cadastrados hoje.", items=self.assistant_response("Não há clientes cadastrados hoje.").items,
-                              usage={"input_tokens": 200, "output_tokens": 20, "total_tokens": 220}),
+                              usage={"prompt_tokens": 200, "completion_tokens": 20, "total_tokens": 220}),
             self.api_response("Próxima interação", items=self.assistant_response("Próxima interação").items),
         ])
         self.service.process_routine_message("DEBTORS", "Alice", "Liste os clientes devedores")
@@ -414,13 +416,15 @@ class RoutineTests(unittest.TestCase):
         self.assertNotIn("CONTENT_JSON", interaction)
         for private in ("local-query-call", "opaque-reasoning-id", "private-opaque-content", "function_call_output"):
             self.assertNotIn(private, json.dumps(history))
-        current_turn = client.responses.create.call_args_list[1].kwargs["input"]
-        call_index = current_turn.index(call)
-        self.assertEqual(current_turn[call_index + 1]["type"], "function_call_output")
-        self.assertEqual(current_turn[call_index + 1]["call_id"], call["call_id"])
+        current_turn = client.chat.completions.create.call_args_list[1].kwargs["messages"]
+        call_index = next(i for i, message in enumerate(current_turn) if message.get("tool_calls"))
+        self.assertEqual(current_turn[call_index]["tool_calls"][0]["id"], call["call_id"])
+        self.assertEqual(current_turn[call_index + 1]["role"], "tool")
+        self.assertEqual(current_turn[call_index + 1]["tool_call_id"], call["call_id"])
+        self.assertNotIn("encrypted_content", json.dumps(current_turn))
         self.service.process_routine_message("DEBTORS", "Alice", "Próximo pedido")
         self.assertEqual(len(self.service.load_chat_history("DEBTORS", "Alice")), 2)
-        self.assertNotIn("local-query-call", json.dumps(client.responses.create.call_args.kwargs["input"]))
+        self.assertNotIn("local-query-call", json.dumps(client.chat.completions.create.call_args.kwargs["messages"]))
         audit = self.audit_rows()
         self.assertEqual(len(audit), 3)
         self.assertNotEqual(audit[2]["CHAT_MESSAGE_ID"], audit[0]["CHAT_MESSAGE_ID"])
@@ -430,7 +434,7 @@ class RoutineTests(unittest.TestCase):
         self.mock_api([
             self.api_response("Uso indisponível", items=self.assistant_response("Uso indisponível").items),
             self.api_response("Uso igual a zero", items=self.assistant_response("Uso igual a zero").items,
-                              usage={"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}),
+                              usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}),
         ])
         self.service.process_routine_message("DEBTORS", "Alice", "Primeira interação")
         self.service.process_routine_message("DEBTORS", "Alice", "Segunda interação")
@@ -443,8 +447,8 @@ class RoutineTests(unittest.TestCase):
         self.seed_chat()
         self.mock_api([
             self.api_response(items=[{"type": "function_call", "call_id": "partial-usage-call", "name": "query_debtors", "arguments": "{}"}],
-                              usage={"input_tokens": 10}, response_id="query-response"),
-            self.api_response("Consulta concluída", items=self.assistant_response("Consulta concluída").items, usage={"output_tokens": 3}),
+                              usage={"prompt_tokens": 10}, response_id="query-response"),
+            self.api_response("Consulta concluída", items=self.assistant_response("Consulta concluída").items, usage={"completion_tokens": 3}),
         ])
         self.service.process_routine_message("DEBTORS", "Alice", "Consultar posição")
         history = self.service.load_chat_history("DEBTORS", "Alice")
@@ -455,7 +459,7 @@ class RoutineTests(unittest.TestCase):
 
     def test_empty_general_response_keeps_usage_only_in_central_audit(self):
         self.seed_chat()
-        self.mock_api([self.api_response(usage={"input_tokens": 14, "output_tokens": 2, "total_tokens": 16}, response_id="empty-response")])
+        self.mock_api([self.api_response(usage={"prompt_tokens": 14, "completion_tokens": 2, "total_tokens": 16}, response_id="empty-response")])
         self.service.process_routine_message("DEBTORS", "Alice", "Exemplo de resposta vazia")
         rows = self.service.load_chat_history("DEBTORS", "Alice")
         self.assertEqual(len(rows), 1)
@@ -470,10 +474,10 @@ class RoutineTests(unittest.TestCase):
     def test_failed_general_response_audits_usage_and_keeps_chat_sanitized(self):
         self.seed_chat()
         client = Mock()
-        client.responses.create.return_value = SimpleNamespace(
-            status="incomplete", output=[{"type": "function_call", "call_id": "partial-private-call", "name": "query_debtors", "arguments": "{}"}],
-            output_text="private-partial-output", id="incomplete-response", model="configured-routine-model",
-            usage={"input_tokens": 120, "output_tokens": 6, "total_tokens": 126})
+        client.chat.completions.create.return_value = self.api_response(
+            "private-partial-output", status="incomplete", response_id="incomplete-response",
+            items=[{"type": "function_call", "call_id": "partial-private-call", "name": "query_debtors", "arguments": "{}"}],
+            usage={"prompt_tokens": 120, "completion_tokens": 6, "total_tokens": 126})
         self.service.ai_service = OpenAIService(client=client, database_path=self.db)
         with self.assertRaises(AIError):
             self.service.process_routine_message("DEBTORS", "Alice", "Pedido interrompido")
@@ -492,7 +496,7 @@ class RoutineTests(unittest.TestCase):
     def test_provider_failure_logs_one_sanitized_interaction_with_unknown_usage(self):
         self.seed_chat()
         client = Mock()
-        client.responses.create.side_effect = RuntimeError("private-provider-detail")
+        client.chat.completions.create.side_effect = RuntimeError("private-provider-detail")
         self.service.ai_service = OpenAIService(client=client, database_path=self.db)
         with self.assertRaises(AIError):
             self.service.process_routine_message("DEBTORS", "Alice", "Consulta com provedor indisponível")
@@ -592,12 +596,12 @@ class RoutineTests(unittest.TestCase):
                      "VL_QUOTE": None, "TS_REF": None, "SPREAD_QUOTE": None}
         extracted = {"intent": "IMPORT", "source": "XP", "clarification_fields": [], "rows": [candidate]}
         client = self.mock_api([self.api_response(json.dumps(extracted),
-            usage={"input_tokens": 12, "output_tokens": 3, "total_tokens": 15}, response_id="extraction-response")])
+            usage={"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15}, response_id="extraction-response")])
         self.service.process_routine_message("NTNB_RUN", "Alice", "XP: NTN-B maio 2027, compra a 7,5%")
-        client.responses.create.assert_called_once()
-        request = client.responses.create.call_args.kwargs
+        client.chat.completions.create.assert_called_once()
+        request = client.chat.completions.create.call_args.kwargs
         self.assertEqual(request["model"], "configured-routine-model")
-        self.assertEqual(request["text"]["format"]["type"], "json_schema")
+        self.assertEqual(request["response_format"]["type"], "json_schema")
         self.assertNotIn("tools", request)
         history = self.service.load_chat_history("NTNB_RUN", "Alice")
         self.assertEqual(len(history), 1)
@@ -650,7 +654,7 @@ class RoutineTests(unittest.TestCase):
         self.seed_chat("NTNB_RUN")
         step = self.schedule("failed-step", deadline="09:00")
         self.mock_api([self.api_response("private-partial-import", status="incomplete",
-            usage={"input_tokens": 9, "output_tokens": 1, "total_tokens": 10})])
+            usage={"prompt_tokens": 9, "completion_tokens": 1, "total_tokens": 10})])
         with self.assertRaises(AIError):
             self.service.process_routine_message("NTNB_RUN", "Alice", "Texto da run XP para interpretação")
         history = self.service.load_chat_history("NTNB_RUN", "Alice")
@@ -821,7 +825,7 @@ class RoutineTests(unittest.TestCase):
         self.service.confirm_action(first['ID_EXECUTION'], 'Alice')
         args['rows'][0]['TX_QUOTE'] = 0.11
         self.mock_api([self.api_response(items=[{'type': 'function_call', 'call_id': 'credit-correction',
-            'name': 'save_quotes', 'arguments': json.dumps(args)}], usage={'input_tokens': 10, 'output_tokens': 5, 'total_tokens': 15})])
+            'name': 'save_quotes', 'arguments': json.dumps(args)}], usage={'prompt_tokens': 10, 'completion_tokens': 5, 'total_tokens': 15})])
         result = self.service.process_routine_message('CREDIT_RUN', 'Alice', 'Correct the saved xBridge run to 11%')
         self.assertEqual(result['status'], 'PENDING_REVIEW')
         self.assertIn('Deseja excluir', result['text'])
@@ -1235,13 +1239,13 @@ class RoutineTests(unittest.TestCase):
         PromptStore(self.db).seed("routines", "closing", "Only this closing activity", "closing-model")
         self.service.append_chat_message("DEBTORS", "Alice", "user", "Sibling secret", activity_id="DEBTORS:DEFAULT")
         client = self.mock_api([self.api_response("Closing response", items=self.assistant_response("Closing response").items,
-            usage={"input_tokens": 8, "output_tokens": 2, "total_tokens": 10})])
+            usage={"prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10})])
         self.service.process_routine_message("DEBTORS", "Alice", "What can you do?", activity_id="closing")
-        request = client.responses.create.call_args.kwargs
-        self.assertIn("Only this closing activity", request["instructions"])
+        request = client.chat.completions.create.call_args.kwargs
+        self.assertIn("Only this closing activity", request["messages"][0]["content"])
         self.assertEqual(request["model"], "closing-model")
-        self.assertEqual([tool["name"] for tool in request["tools"]], ["debtor_report"])
-        self.assertNotIn("Sibling secret", json.dumps(request["input"]))
+        self.assertEqual([tool["function"]["name"] for tool in request["tools"]], ["debtor_report"])
+        self.assertNotIn("Sibling secret", json.dumps(request["messages"]))
         chat = self.service.load_chat_history("DEBTORS", "Alice", activity_id="closing")
         self.assertEqual(len(chat), 1)
         self.assertEqual(chat[0]["ID_ACTIVITY"], "closing")
@@ -1522,56 +1526,76 @@ class ConversationTransportTests(unittest.TestCase):
         self.store.seed("routines", "test-chat", "Prompt from the existing store", "model-from-sqlite")
         self.prompt = self.store.get_active("routines", "test-chat")
 
-    def test_existing_transport_replays_complete_items_with_call_ids(self):
+    def test_existing_transport_converts_tool_events_to_chat_messages_with_call_ids(self):
         output = [
             {"type": "reasoning", "id": "reasoning-1", "summary": [], "encrypted_content": "opaque"},
             {"type": "function_call", "call_id": "call-1", "name": "save_quotes", "arguments": "{}"},
         ]
         client = Mock()
-        client.responses.create.return_value = SimpleNamespace(
-            status="completed", output=output, output_text="", id="response-1", model="model-from-sqlite")
+        client.chat.completions.create.return_value = chat_completion(
+            None, tool_calls=[{"id": "call-1", "type": "function", "function": {"name": "save_quotes", "arguments": "{}"}}],
+            finish_reason="tool_calls", response_id="response-1", model="model-from-sqlite")
         history = [{"role": "user", "content": "Import this run"}]
         tools = [{"type": "function", "name": "save_quotes", "parameters": {"type": "object", "properties": {}}}]
         result = OpenAIService(client=client, database_path=self.db).converse(prompt=self.prompt, items=history, tools=tools)
-        request = client.responses.create.call_args.kwargs
+        request = client.chat.completions.create.call_args.kwargs
         self.assertEqual(request["model"], "model-from-sqlite")
-        self.assertEqual(request["instructions"], "Prompt from the existing store")
-        self.assertEqual(request["input"], history)
-        self.assertEqual(request["tools"], tools)
+        self.assertEqual(request["messages"], [{"role": "system", "content": "Prompt from the existing store"}, *history])
+        self.assertEqual(request["tools"], [{"type": "function", "function": {
+            "name": "save_quotes", "parameters": {"type": "object", "properties": {}}}}])
         self.assertFalse(request["store"])
-        self.assertIn("reasoning.encrypted_content", request["include"])
-        self.assertEqual(result.items, output)
+        self.assertFalse(request["parallel_tool_calls"])
+        self.assertNotIn("include", request)
+        self.assertEqual(result.items, output[1:])
+
+    def test_assistant_text_and_tool_results_replay_as_chat_turns(self):
+        client = Mock()
+        client.chat.completions.create.return_value = chat_completion(
+            "I will check.", finish_reason="tool_calls", tool_calls=[
+                {"id": "query-1", "type": "function", "function": {"name": "query_debtors", "arguments": "{}"}},
+            ])
+        service = OpenAIService(client=client, database_path=self.db)
+        history = [{"role": "user", "content": "Check the cases"}]
+        result = service.converse(prompt=self.prompt, items=history, tools=[])
+        history.extend(result.items)
+        history.append({"type": "function_call_output", "call_id": "query-1", "output": '{"rows": []}'})
+        client.chat.completions.create.return_value = chat_completion("No cases.")
+        service.converse(prompt=self.prompt, items=history, tools=[])
+        messages = client.chat.completions.create.call_args.kwargs["messages"]
+        self.assertEqual([message["role"] for message in messages], ["system", "user", "assistant", "tool"])
+        self.assertEqual(messages[2]["content"], [{"type": "text", "text": "I will check."}])
+        self.assertEqual(messages[2]["tool_calls"][0]["id"], "query-1")
+        self.assertEqual(messages[3], {"role": "tool", "tool_call_id": "query-1", "content": '{"rows": []}'})
+        self.assertEqual(history[1]["content"][0]["type"], "output_text")
 
     def test_provider_details_are_not_exposed_to_chat_user(self):
         client = Mock()
-        client.responses.create.side_effect = RuntimeError("sensitive credential or provider detail")
+        client.chat.completions.create.side_effect = RuntimeError("sensitive credential or provider detail")
         with self.assertRaises(AIError) as error:
             OpenAIService(client=client, database_path=self.db).converse(prompt=self.prompt, items=[], tools=[])
         self.assertNotIn("sensitive", str(error.exception))
 
     def test_conversation_transport_uses_api_counts_from_object_or_dict_usage(self):
         cases = [
-            (SimpleNamespace(input_tokens=53, output_tokens=7, total_tokens=60), (53, 7, 60)),
-            ({"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}, (0, 0, 0)),
-            ({"input_tokens": 5, "output_tokens": 2}, (5, 2, None)),
+            (SimpleNamespace(prompt_tokens=53, completion_tokens=7, total_tokens=60), (53, 7, 60)),
+            ({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}, (0, 0, 0)),
+            ({"prompt_tokens": 5, "completion_tokens": 2}, (5, 2, None)),
             (None, (None, None, None)),
-            ({"input_tokens": True, "output_tokens": -3, "total_tokens": 1.5}, (None, None, None)),
+            ({"prompt_tokens": True, "completion_tokens": -3, "total_tokens": 1.5}, (None, None, None)),
         ]
         for usage, expected in cases:
             with self.subTest(usage=usage):
                 client = Mock()
-                response = SimpleNamespace(status="completed", output=[], output_text="", id="usage-response", model="model-from-sqlite")
-                if usage is not None:
-                    response.usage = usage
-                client.responses.create.return_value = response
+                response = chat_completion("", usage=usage, response_id="usage-response", model="model-from-sqlite")
+                client.chat.completions.create.return_value = response
                 result = OpenAIService(client=client, database_path=self.db).converse(prompt=self.prompt, items=[], tools=[])
                 self.assertEqual((result.input_tokens, result.output_tokens, result.total_tokens), expected)
 
     def test_incomplete_conversation_keeps_api_reported_counts_and_response_identity(self):
         client = Mock()
-        client.responses.create.return_value = SimpleNamespace(
-            status="incomplete", output=[], output_text="private-partial-output", id="incomplete-provider-id",
-            model="actual-provider-model", usage={"input_tokens": 80, "output_tokens": 12, "total_tokens": 92})
+        client.chat.completions.create.return_value = chat_completion(
+            "private-partial-output", finish_reason="length", response_id="incomplete-provider-id",
+            model="actual-provider-model", usage={"prompt_tokens": 80, "completion_tokens": 12, "total_tokens": 92})
         with self.assertRaises(AIError) as error:
             OpenAIService(client=client, database_path=self.db).converse(prompt=self.prompt, items=[], tools=[])
         self.assertEqual((error.exception.input_tokens, error.exception.output_tokens, error.exception.total_tokens), (80, 12, 92))
